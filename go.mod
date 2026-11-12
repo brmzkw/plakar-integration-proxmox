@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/PlakarKorp/go-kloset-sdk v1.1.0
 	github.com/PlakarKorp/kloset v1.1.9
+	github.com/google/uuid v1.6.0
 	golang.org/x/crypto v0.53.0
 )
 
@@ -12,7 +13,6 @@ require (
 	github.com/PlakarKorp/integration-grpc v1.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

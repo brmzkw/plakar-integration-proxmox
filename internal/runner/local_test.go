@@ -14,35 +14,28 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-package proxmox
+package runner
 
 import (
-	"fmt"
-	"io"
-	"os"
-	"sync"
+	"context"
+	"strings"
+	"testing"
+	"time"
 )
 
-var (
-	warnMu sync.Mutex
-	warnTo io.Writer = os.Stderr
-)
-
-func Warnf(format string, args ...any) {
-	warnMu.Lock()
-	defer warnMu.Unlock()
-	_, _ = fmt.Fprintf(warnTo, "proxmox: warning: "+format+"\n", args...)
+func TestLocalRunReturnsOutput(t *testing.T) {
+	stdout, stderr, err := (&Local{}).Run(context.Background(), "sh", "-c", "echo out; echo err >&2")
+	if err != nil || stdout != "out\n" || stderr != "err\n" {
+		t.Fatalf("got %q, %q, %v", stdout, stderr, err)
+	}
 }
 
-func SetWarnWriter(w io.Writer) func() {
-	warnMu.Lock()
-	previous := warnTo
-	warnTo = w
-	warnMu.Unlock()
+func TestLocalRunCancelSendsTerm(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
 
-	return func() {
-		warnMu.Lock()
-		warnTo = previous
-		warnMu.Unlock()
+	stdout, _, _ := (&Local{}).Run(ctx, "sh", "-c", `trap 'echo cleaned; exit 1' TERM; echo started; while :; do sleep 0.05; done`)
+	if !strings.Contains(stdout, "cleaned") {
+		t.Fatalf("command was not given SIGTERM, stdout %q", stdout)
 	}
 }

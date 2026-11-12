@@ -17,6 +17,7 @@
 package main
 
 import (
+	"log"
 	"os"
 
 	sdk "github.com/PlakarKorp/go-kloset-sdk"
@@ -24,5 +25,7 @@ import (
 )
 
 func main() {
+	log.SetFlags(0)
+	log.SetPrefix("proxmox: warning: ")
 	sdk.EntrypointExporter(os.Args, exporter.NewProxmoxExporter)
 }

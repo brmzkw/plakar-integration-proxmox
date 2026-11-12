@@ -18,29 +18,24 @@ package proxmox
 
 import (
 	"context"
-	"io"
+	"log"
 	"sync"
 )
 
-// TempFiles tracks the artefacts an operation leaves in dump_dir so they are
-// removed on every exit path, failures included.
 type TempFiles struct {
-	client  *Client
-	enabled bool
+	client *Client
 
 	mu    sync.Mutex
 	paths map[string]struct{}
 }
 
-func NewTempFiles(client *Client, enabled bool) *TempFiles {
+func NewTempFiles(client *Client) *TempFiles {
 	return &TempFiles{
-		client:  client,
-		enabled: enabled,
-		paths:   make(map[string]struct{}),
+		client: client,
+		paths:  make(map[string]struct{}),
 	}
 }
 
-// Track registers a file for removal by Sweep.
 func (t *TempFiles) Track(filepath string) {
 	if filepath == "" {
 		return
@@ -51,24 +46,22 @@ func (t *TempFiles) Track(filepath string) {
 	t.mu.Unlock()
 }
 
-// Forget drops a file from the tracking set without removing it.
 func (t *TempFiles) Forget(filepath string) {
 	t.mu.Lock()
 	delete(t.paths, filepath)
 	t.mu.Unlock()
 }
 
-// Remove deletes a tracked file now, along with the vzdump log sitting beside
-// it, and stops tracking it.
 func (t *TempFiles) Remove(ctx context.Context, filepath string) error {
-	t.Forget(filepath)
-	if !t.enabled || filepath == "" {
+	if filepath == "" {
 		return nil
 	}
 
+	ctx = context.WithoutCancel(ctx)
 	if err := t.client.Remove(ctx, filepath); err != nil {
 		return err
 	}
+	t.Forget(filepath)
 
 	if logPath := DumpLogPath(filepath); logPath != "" {
 		_ = t.client.Remove(ctx, logPath)
@@ -76,56 +69,17 @@ func (t *TempFiles) Remove(ctx context.Context, filepath string) error {
 	return nil
 }
 
-// Adopt hands a tracked file over to a reader: the file lives until that reader
-// is closed, then is removed.
-func (t *TempFiles) Adopt(ctx context.Context, filepath string, reader io.ReadCloser) io.ReadCloser {
-	t.Forget(filepath)
-	if !t.enabled {
-		return reader
-	}
-
-	cleanupCtx := context.WithoutCancel(ctx)
-
-	return &cleanupReadCloser{
-		ReadCloser: reader,
-		cleanup: func() {
-			if err := t.Remove(cleanupCtx, filepath); err != nil {
-				Warnf("unable to remove temporary dump %s: %v", filepath, err)
-			}
-		},
-	}
-}
-
-// Sweep removes every file still tracked, best effort.
 func (t *TempFiles) Sweep(ctx context.Context) {
 	t.mu.Lock()
 	paths := make([]string, 0, len(t.paths))
 	for filepath := range t.paths {
 		paths = append(paths, filepath)
 	}
-	t.paths = make(map[string]struct{})
 	t.mu.Unlock()
 
-	if !t.enabled {
-		return
-	}
-
-	cleanupCtx := context.WithoutCancel(ctx)
 	for _, filepath := range paths {
-		if err := t.Remove(cleanupCtx, filepath); err != nil {
-			Warnf("unable to remove temporary dump %s: %v", filepath, err)
+		if err := t.Remove(ctx, filepath); err != nil {
+			log.Printf("unable to remove temporary dump %s: %v", filepath, err)
 		}
 	}
-}
-
-type cleanupReadCloser struct {
-	io.ReadCloser
-	once    sync.Once
-	cleanup func()
-}
-
-func (r *cleanupReadCloser) Close() error {
-	err := r.ReadCloser.Close()
-	r.once.Do(r.cleanup)
-	return err
 }

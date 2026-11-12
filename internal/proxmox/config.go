@@ -33,7 +33,10 @@ const (
 	DefaultSSHRetryDelay = 2 * time.Second
 )
 
-const DefaultSSHKnownHosts = "~/.ssh/known_hosts"
+const (
+	ProviderStorage     = "plakar"
+	ProviderSessionRoot = "/run/plakar"
+)
 
 const (
 	ModeLocal  = "local"
@@ -49,21 +52,18 @@ type Config struct {
 	Location *url.URL
 	Host     string
 
-	Mode                     string
-	ConnMethod               string
-	ConnUsername             string
-	ConnPassword             string
-	ConnIdentityFile         string
-	ConnIdentityKey          string
-	DumpDir                  string
-	BackupCompression        string
-	BackupMode               string
-	Node                     string
-	Cleanup                  bool
-	SSHRetryCount            int
-	SSHRetryDelay            time.Duration
-	SSHKnownHosts            string
-	SSHInsecureIgnoreHostKey bool
+	Mode             string
+	ConnMethod       string
+	ConnUsername     string
+	ConnPassword     string
+	ConnIdentityFile string
+	ConnIdentityKey  string
+	DumpDir          string
+	BackupMode       string
+	FleecingStorage  string
+	Node             string
+	SSHRetryCount    int
+	SSHRetryDelay    time.Duration
 }
 
 func ParseConfig(config map[string]string) (*Config, error) {
@@ -142,23 +142,13 @@ func ParseConfig(config map[string]string) (*Config, error) {
 		}
 	}
 
-	cfg.BackupCompression = strings.TrimSpace(config["backup_compression"])
-	if cfg.BackupCompression == "" {
-		cfg.BackupCompression = "0"
-	}
-
 	cfg.BackupMode = strings.TrimSpace(config["backup_mode"])
 	if cfg.BackupMode == "" {
 		cfg.BackupMode = "snapshot"
 	}
 
+	cfg.FleecingStorage = strings.TrimSpace(config["fleecing_storage"])
 	cfg.Node = strings.TrimSpace(config["node"])
-
-	cleanup, err := parseBool(config, "cleanup", true)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Cleanup = cleanup
 
 	sshRetryCount, err := parseInt(config, "ssh_retry_count", DefaultSSHRetryCount)
 	if err != nil {
@@ -178,31 +168,7 @@ func ParseConfig(config map[string]string) (*Config, error) {
 	}
 	cfg.SSHRetryDelay = sshRetryDelay
 
-	if err := parseHostKeyConfig(cfg, config); err != nil {
-		return nil, err
-	}
-
 	return cfg, nil
-}
-
-func parseHostKeyConfig(cfg *Config, config map[string]string) error {
-	insecure, err := parseBool(config, "ssh_insecure_ignore_host_key", false)
-	if err != nil {
-		return err
-	}
-	cfg.SSHInsecureIgnoreHostKey = insecure
-
-	cfg.SSHKnownHosts = strings.TrimSpace(config["ssh_known_hosts"])
-	if cfg.SSHKnownHosts == "" {
-		cfg.SSHKnownHosts = DefaultSSHKnownHosts
-	}
-
-	if cfg.Mode != ModeRemote {
-		return nil
-	}
-
-	cfg.SSHKnownHosts, err = expandPath(cfg.SSHKnownHosts)
-	return err
 }
 
 func (c *Config) Origin() string {

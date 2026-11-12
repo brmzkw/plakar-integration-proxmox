@@ -25,43 +25,26 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gillesdubois/plakar-integration-proxmox/internal/runner"
 )
 
-func TestCompressionSuffix(t *testing.T) {
-	cases := map[string]string{"0": "", "1": ".lzo", "lzo": ".lzo", "gzip": ".gz", "zstd": ".zst"}
-	for compress, want := range cases {
-		if got, err := compressionSuffix(compress); err != nil || got != want {
-			t.Errorf("%q: got %q, %v, want %q", compress, got, err, want)
-		}
-	}
-	if _, err := compressionSuffix("bzip2"); err == nil {
-		t.Error("unknown compression must be rejected")
-	}
-}
-
-// streamRunner counts the vzdump streams it starts; every other call fails.
 type streamRunner struct {
-	Runner
+	runner.Runner
 	started int32
 }
 
-func (r *streamRunner) Stream(ctx context.Context, name string, args ...string) (*CommandStream, error) {
+func (r *streamRunner) Stream(ctx context.Context, name string, args ...string) (*runner.CommandStream, error) {
 	atomic.AddInt32(&r.started, 1)
-	return &CommandStream{
-		Stdout: strings.NewReader("VMA\x00data"),
-		Stderr: strings.NewReader(""),
-	}, nil
+	return runner.NewCommandStream(strings.NewReader("VMA\x00data"), strings.NewReader(""), nil, nil), nil
 }
 
 func TestBackupVMStreamStartsVzdumpOnFirstRead(t *testing.T) {
 	runner := &streamRunner{}
-	client := &Client{cfg: &Config{BackupMode: "snapshot", BackupCompression: "zstd"}, runner: runner}
+	client := &Client{cfg: &Config{BackupMode: "snapshot"}, runner: runner}
 
-	name, reader, err := client.BackupVMStream(context.Background(), "qemu", 301)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(name, "vzdump-qemu-301-") || !strings.HasSuffix(name, ".vma.zst") {
+	name, reader := client.BackupLXCStream(context.Background(), 301)
+	if !strings.HasPrefix(name, "vzdump-lxc-301-") || !strings.HasSuffix(name, ".tar") {
 		t.Errorf("unexpected archive name %q", name)
 	}
 	if atomic.LoadInt32(&runner.started) != 0 {
@@ -74,8 +57,7 @@ func TestBackupVMStreamStartsVzdumpOnFirstRead(t *testing.T) {
 	}
 	_ = reader.Close()
 
-	// A record plakar never reads must not start vzdump at all.
-	_, unread, _ := client.BackupVMStream(context.Background(), "lxc", 500)
+	_, unread := client.BackupLXCStream(context.Background(), 500)
 	if err := unread.Close(); err != nil || atomic.LoadInt32(&runner.started) != 1 {
 		t.Fatalf("closing an unread stream: err=%v started=%d", err, atomic.LoadInt32(&runner.started))
 	}
@@ -83,10 +65,10 @@ func TestBackupVMStreamStartsVzdumpOnFirstRead(t *testing.T) {
 
 func TestOneVzdumpAtATime(t *testing.T) {
 	runner := &streamRunner{}
-	client := &Client{cfg: &Config{BackupMode: "snapshot", BackupCompression: "0"}, runner: runner}
+	client := &Client{cfg: &Config{BackupMode: "snapshot"}, runner: runner}
 
-	_, first, _ := client.BackupVMStream(context.Background(), "qemu", 301)
-	_, second, _ := client.BackupVMStream(context.Background(), "qemu", 302)
+	_, first := client.BackupLXCStream(context.Background(), 301)
+	_, second := client.BackupLXCStream(context.Background(), 302)
 
 	if _, err := first.Read(make([]byte, 1)); err != nil {
 		t.Fatal(err)
@@ -129,5 +111,29 @@ func TestStreamReadCloserReportsVzdumpFailure(t *testing.T) {
 	}
 	if cerr := r.Close(); cerr == nil {
 		t.Fatal("Close must keep reporting the vzdump failure")
+	}
+}
+
+type shRunner struct {
+	runner.Local
+	script string
+}
+
+func (r *shRunner) Stream(ctx context.Context, _ string, _ ...string) (*runner.CommandStream, error) {
+	return r.Local.Stream(ctx, "sh", "-c", r.script)
+}
+
+func TestLocalVzdumpFailureKeepsStderr(t *testing.T) {
+	for script, want := range map[string]string{
+		`for i in $(seq 200); do echo "INFO: line $i" >&2; done; echo "ERROR: CT 301 is locked" >&2; exit 2`: "CT 301 is locked",
+		`exit 0`: "no data",
+	} {
+		client := &Client{cfg: &Config{BackupMode: "snapshot"}, runner: &shRunner{script: script}}
+		_, reader := client.BackupLXCStream(context.Background(), 301)
+		_, err := io.ReadAll(reader)
+		_ = reader.Close()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want an error with %q", script, err, want)
+		}
 	}
 }

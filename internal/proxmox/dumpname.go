@@ -27,9 +27,11 @@ import (
 )
 
 const DumpFilenameVersion = 1
-const QEMUConfigSidecarSuffix = "_qemu.conf"
-const LXCConfigSidecarSuffix = "_lxc.conf"
-const PoolSidecarSuffix = "_pool.conf"
+const (
+	SidecarQEMU = "qemu"
+	SidecarLXC  = "lxc"
+	SidecarPool = "pool"
+)
 
 var dumpNameRegex = regexp.MustCompile(`^vzdump(?:-v(\d+))?-(qemu|lxc)-(\d+)-`)
 
@@ -60,22 +62,11 @@ func ParseDumpFilename(name string) (string, int, error) {
 	return matches[2], vmid, nil
 }
 
-func BuildDumpFilename(_ *Config, vmType string, vmid int, timestamp, baseExt, compressionSuffix string) string {
-	return fmt.Sprintf("vzdump-%s-%d-%s.%s%s", vmType, vmid, timestamp, baseExt, compressionSuffix)
-}
-
 func BuildRestoreDumpFilename(originalName, vmType string, vmid int, now time.Time) string {
 	suffix := canonicalArchiveSuffix(originalName, vmType)
 	return fmt.Sprintf("vzdump-%s-%d-%s%s", vmType, vmid, now.Format("2006_01_02-15_04_05"), suffix)
 }
 
-// DumpLogPath returns the vzdump log file sitting next to an archive, or "" when
-// the name does not follow the vzdump convention.
-//
-// vzdump derives both names from one basename, so the archive
-// "vzdump-qemu-101-2026_01_01-00_00_00.vma.zst" comes with the log file
-// "vzdump-qemu-101-2026_01_01-00_00_00.log". Nothing ever removed those logs,
-// so every run used to leave one more file behind in dump_dir.
 func DumpLogPath(archivePath string) string {
 	base := path.Base(archivePath)
 	lower := strings.ToLower(base)
@@ -94,68 +85,19 @@ func DumpLogPath(archivePath string) string {
 	return path.Join(path.Dir(archivePath), base[:idx]+".log")
 }
 
-func BuildQEMUConfigSidecarFilename(archiveName string) string {
-	return archiveName + QEMUConfigSidecarSuffix
+func SidecarFilename(archiveName, kind string) string {
+	return archiveName + "_" + kind + ".conf"
 }
 
-func BuildLXCConfigSidecarFilename(archiveName string) string {
-	return archiveName + LXCConfigSidecarSuffix
-}
-
-func BuildPoolSidecarFilename(archiveName string) string {
-	return archiveName + PoolSidecarSuffix
-}
-
-func IsQEMUConfigSidecarFilename(name string) bool {
-	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), QEMUConfigSidecarSuffix)
-}
-
-func IsLXCConfigSidecarFilename(name string) bool {
-	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), LXCConfigSidecarSuffix)
-}
-
-func IsConfigSidecarFilename(name string) bool {
-	return IsQEMUConfigSidecarFilename(name) || IsLXCConfigSidecarFilename(name)
-}
-
-func IsPoolSidecarFilename(name string) bool {
-	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), PoolSidecarSuffix)
-}
-
-func ParseConfigSidecarFilename(name string) (string, string, error) {
+func ParseSidecarFilename(name string) (archiveName, kind string, ok bool) {
 	base := filepath.Base(name)
-	lower := strings.ToLower(base)
-
-	switch {
-	case strings.HasSuffix(lower, QEMUConfigSidecarSuffix):
-		dumpName := base[:len(base)-len(QEMUConfigSidecarSuffix)]
-		if dumpName == "" {
-			return "", "", fmt.Errorf("invalid qemu config sidecar filename: %s", base)
+	for _, kind := range []string{SidecarQEMU, SidecarLXC, SidecarPool} {
+		suffix := "_" + kind + ".conf"
+		if strings.HasSuffix(strings.ToLower(base), suffix) {
+			return base[:len(base)-len(suffix)], kind, true
 		}
-		return dumpName, "qemu", nil
-	case strings.HasSuffix(lower, LXCConfigSidecarSuffix):
-		dumpName := base[:len(base)-len(LXCConfigSidecarSuffix)]
-		if dumpName == "" {
-			return "", "", fmt.Errorf("invalid lxc config sidecar filename: %s", base)
-		}
-		return dumpName, "lxc", nil
-	default:
-		return "", "", fmt.Errorf("invalid config sidecar filename: %s", base)
 	}
-}
-
-func ParsePoolSidecarFilename(name string) (string, error) {
-	base := filepath.Base(name)
-	lower := strings.ToLower(base)
-	if !strings.HasSuffix(lower, PoolSidecarSuffix) {
-		return "", fmt.Errorf("invalid pool sidecar filename: %s", base)
-	}
-
-	dumpName := base[:len(base)-len(PoolSidecarSuffix)]
-	if dumpName == "" {
-		return "", fmt.Errorf("invalid pool sidecar filename: %s", base)
-	}
-	return dumpName, nil
+	return "", "", false
 }
 
 func canonicalArchiveSuffix(originalName, vmType string) string {

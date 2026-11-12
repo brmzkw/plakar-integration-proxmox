@@ -21,7 +21,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -89,10 +91,11 @@ func (p *ProxmoxImporter) Ping(ctx context.Context) error {
 	return p.preflight(ctx)
 }
 
-// preflight checks what the whole job depends on before any VM is touched.
-// Dumps are streamed from vzdump's stdout, so dump_dir is not needed here.
 func (p *ProxmoxImporter) preflight(ctx context.Context) error {
-	return p.client.CheckCommands(ctx, "pvesh", "vzdump")
+	if err := p.client.CheckCommands(ctx, "pvesh", "vzdump"); err != nil {
+		return err
+	}
+	return p.client.CheckNode(ctx)
 }
 
 func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors.Record, _ <-chan *connectors.Result) error {
@@ -108,6 +111,9 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 	}
 	if len(vmids) == 0 {
 		return fmt.Errorf("no VM/CT found for selection")
+	}
+	if err := p.checkProvider(ctx, vmids); err != nil {
+		return err
 	}
 
 	var (
@@ -126,11 +132,9 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 				return err
 			}
 
-			// A single locked or broken VM must not throw away the VMs that
-			// backed up fine: report it as a failed entry and carry on.
 			failed++
 			lastErr = err
-			proxmox.Warnf("backup of vmid %d failed: %v", vmid, err)
+			log.Printf("backup of vmid %d failed: %v", vmid, err)
 
 			failure := connectors.NewError(vmFailurePath(vmid), err)
 			if emitErr := p.emitRecord(ctx, records, failure); emitErr != nil {
@@ -145,7 +149,7 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 		return fmt.Errorf("all %d VM/CT backup(s) failed, last error: %w", failed, lastErr)
 	}
 	if failed > 0 {
-		proxmox.Warnf("%d of %d VM/CT failed to back up", failed, failed+succeeded)
+		log.Printf("%d of %d VM/CT failed to back up", failed, failed+succeeded)
 	}
 	return nil
 }
@@ -165,19 +169,60 @@ func (p *ProxmoxImporter) importVM(ctx context.Context, records chan<- *connecto
 		return err
 	}
 
-	record, archiveName, err := p.buildBackupRecord(ctx, vmType, vmid, vmName)
+	if vmType == "qemu" {
+		return p.importVMProvider(ctx, records, vmid, vmName)
+	}
+
+	configData, err := p.client.ReadLXCConfig(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	pool, err := p.client.VMPool(ctx, vmid)
 	if err != nil {
 		return err
 	}
 
+	record, archiveName := p.buildBackupRecord(ctx, vmid, vmName)
 	if err := p.emitRecord(ctx, records, record); err != nil {
 		return err
 	}
-
-	if err := p.emitVMConfigRecord(ctx, records, vmType, vmid, vmName, archiveName); err != nil {
+	if err := p.emitSidecar(ctx, records, vmid, vmName, proxmox.SidecarFilename(archiveName, proxmox.SidecarLXC), configData); err != nil {
 		return err
 	}
-	return p.emitVMPoolRecord(ctx, records, vmType, vmid, vmName, archiveName)
+	if pool == "" {
+		return nil
+	}
+	return p.emitSidecar(ctx, records, vmid, vmName, proxmox.SidecarFilename(archiveName, proxmox.SidecarPool), []byte(pool))
+}
+
+func (p *ProxmoxImporter) checkProvider(ctx context.Context, vmids []int) error {
+	for _, vmid := range vmids {
+		if vmType, err := p.client.VMType(ctx, vmid); err == nil && vmType == "qemu" {
+			return p.client.CheckProvider(ctx)
+		}
+	}
+	return nil
+}
+
+// One record per VM: several records waiting on one vzdump session would deadlock.
+func (p *ProxmoxImporter) importVMProvider(ctx context.Context, records chan<- *connectors.Record, vmid int, vmName string) error {
+	pool, err := p.client.VMPool(ctx, vmid)
+	if err != nil {
+		return err
+	}
+
+	name := proxmox.ProviderArchiveName(time.Now())
+	return p.emitRecord(ctx, records, &connectors.Record{
+		Pathname: buildBackupSnapshotPath("qemu", vmid, vmName, name),
+		FileInfo: objects.FileInfo{
+			Lname:    name,
+			Lsize:    -1,
+			Lmode:    0600,
+			LmodTime: time.Now(),
+			Ldev:     1,
+		},
+		Reader: p.client.ProviderBackupStream(ctx, vmid, pool),
+	})
 }
 
 func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
@@ -186,95 +231,39 @@ func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
 		return []int{*p.selection.vmid}, nil
 	case p.selection.pool != "":
 		return p.client.ListPoolVMIDs(ctx, p.selection.pool)
-	case p.selection.all:
-		return p.client.ListAllVMIDs(ctx)
 	default:
-		return nil, fmt.Errorf("missing backup selection: vmid, pool or all")
+		return p.client.ListAllVMIDs(ctx)
 	}
 }
 
-func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, vmid int, vmName string) (*connectors.Record, string, error) {
-	archiveName, reader, err := p.client.BackupVMStream(ctx, vmType, vmid)
-	if err != nil {
-		return nil, "", err
-	}
+func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int, vmName string) (*connectors.Record, string) {
+	archiveName, reader := p.client.BackupLXCStream(ctx, vmid)
 
 	return &connectors.Record{
-		Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, archiveName),
+		Pathname: buildBackupSnapshotPath("lxc", vmid, vmName, archiveName),
 		FileInfo: objects.FileInfo{
-			Lname: archiveName,
-			// Unknown until the stream ends: kloset records the size it read.
+			Lname:    archiveName,
 			Lsize:    -1,
 			Lmode:    0600,
 			LmodTime: time.Now(),
 			Ldev:     1,
 		},
 		Reader: reader,
-	}, archiveName, nil
+	}, archiveName
 }
 
-func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<- *connectors.Record, vmType string, vmid int, vmName, archiveName string) error {
-	var (
-		configData []byte
-		configName string
-		err        error
-	)
-
-	switch vmType {
-	case "qemu":
-		configData, err = p.client.ReadQEMUConfig(ctx, vmid)
-		configName = proxmox.BuildQEMUConfigSidecarFilename(archiveName)
-	case "lxc":
-		configData, err = p.client.ReadLXCConfig(ctx, vmid)
-		configName = proxmox.BuildLXCConfigSidecarFilename(archiveName)
-	default:
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-
-	record := &connectors.Record{
-		Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, configName),
+func (p *ProxmoxImporter) emitSidecar(ctx context.Context, records chan<- *connectors.Record, vmid int, vmName, name string, data []byte) error {
+	return p.emitRecord(ctx, records, &connectors.Record{
+		Pathname: buildBackupSnapshotPath("lxc", vmid, vmName, name),
 		FileInfo: objects.FileInfo{
-			Lname:    configName,
-			Lsize:    int64(len(configData)),
+			Lname:    name,
+			Lsize:    int64(len(data)),
 			Lmode:    0600,
 			LmodTime: time.Now(),
 			Ldev:     1,
 		},
-		Reader: io.NopCloser(bytes.NewReader(configData)),
-	}
-
-	return p.emitRecord(ctx, records, record)
-}
-
-func (p *ProxmoxImporter) emitVMPoolRecord(ctx context.Context, records chan<- *connectors.Record, vmType string, vmid int, vmName, archiveName string) error {
-	poolName, err := p.client.VMPool(ctx, vmid)
-	if err != nil {
-		return err
-	}
-	poolName = strings.TrimSpace(poolName)
-	if poolName == "" {
-		return nil
-	}
-
-	poolSidecarName := proxmox.BuildPoolSidecarFilename(archiveName)
-	poolData := []byte(poolName)
-
-	record := &connectors.Record{
-		Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, poolSidecarName),
-		FileInfo: objects.FileInfo{
-			Lname:    poolSidecarName,
-			Lsize:    int64(len(poolData)),
-			Lmode:    0600,
-			LmodTime: time.Now(),
-			Ldev:     1,
-		},
-		Reader: io.NopCloser(bytes.NewReader(poolData)),
-	}
-
-	return p.emitRecord(ctx, records, record)
+		Reader: io.NopCloser(bytes.NewReader(data)),
+	})
 }
 
 func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connectors.Record, record *connectors.Record) error {
@@ -287,7 +276,6 @@ func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connec
 	return nil
 }
 
-// vmFailurePath names the entry reported for a VM that could not be dumped.
 func vmFailurePath(vmid int) string {
 	return path.Join(backupSnapshotRoot, strconv.Itoa(vmid))
 }
@@ -304,35 +292,10 @@ func buildBackupSnapshotDir(vmid int, vmName string) string {
 	return fmt.Sprintf("%d_%s", vmid, name)
 }
 
+var unsafeDirChars = regexp.MustCompile(`[^A-Za-z0-9.-]+`)
+
 func sanitizeSnapshotDirComponent(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-
-	var b strings.Builder
-	b.Grow(len(value))
-
-	lastUnderscore := false
-	for _, r := range value {
-		allowed := (r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') ||
-			r == '-' || r == '.'
-
-		if allowed {
-			b.WriteRune(r)
-			lastUnderscore = false
-			continue
-		}
-
-		if !lastUnderscore {
-			b.WriteByte('_')
-			lastUnderscore = true
-		}
-	}
-
-	return strings.Trim(b.String(), "._-")
+	return strings.Trim(unsafeDirChars.ReplaceAllString(strings.TrimSpace(value), "_"), "._-")
 }
 
 func parseSelection(config map[string]string) (selection, error) {
@@ -358,8 +321,13 @@ func parseSelection(config map[string]string) (selection, error) {
 
 	if all, ok := config["all"]; ok {
 		all = strings.TrimSpace(all)
-		if all == "" || strings.EqualFold(all, "true") || all == "1" || strings.EqualFold(all, "yes") {
-			sel.all = true
+		sel.all = true
+		if all != "" {
+			parsed, err := strconv.ParseBool(all)
+			if err != nil {
+				return sel, fmt.Errorf("invalid all value: %s", all)
+			}
+			sel.all = parsed
 		}
 	}
 
@@ -375,7 +343,7 @@ func parseSelection(config map[string]string) (selection, error) {
 	}
 
 	if setCount == 0 {
-		return sel, nil
+		return sel, fmt.Errorf("missing backup selection: set one of vmid, pool or all=true")
 	}
 	if setCount > 1 {
 		return sel, fmt.Errorf("backup selection must specify only one of vmid, pool or all")

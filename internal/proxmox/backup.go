@@ -32,35 +32,15 @@ import (
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
-// BackupVMStream returns the archive name for a VM/CT and a reader over
-// `vzdump --stdout`; nothing is written to the node. A vzdump failure
-// surfaces as an error from the reader at EOF.
-//
-// vzdump only starts on the first Read. Started up front, it would take the
-// node-wide vzdump lock while its record still waits in plakar's queue, and
-// the importer would then block on the next VM's vzdump waiting for that lock.
-func (c *Client) BackupVMStream(ctx context.Context, vmType string, vmid int) (string, io.ReadCloser, error) {
-	baseExt, err := dumpBaseExtension(vmType)
-	if err != nil {
-		return "", nil, err
-	}
-
-	suffix, err := compressionSuffix(c.cfg.BackupCompression)
-	if err != nil {
-		return "", nil, err
-	}
-
-	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
-	if c.cfg.Node != "" {
-		args = append(args, "--node", c.cfg.Node)
-	}
-
-	timestamp := time.Now().Format("2006_01_02-15_04_05")
-	archiveName := BuildDumpFilename(c.cfg, vmType, vmid, timestamp, baseExt, suffix)
+// vzdump starts on the first Read: started earlier, it would hold the node-wide
+// vzdump lock while its record still waits in plakar's queue.
+func (c *Client) BackupLXCStream(ctx context.Context, vmid int) (string, io.ReadCloser) {
+	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", "0"}
+	archiveName := fmt.Sprintf("vzdump-lxc-%d-%s.tar", vmid, time.Now().Format("2006_01_02-15_04_05"))
 
 	return archiveName, connectors.NewLazyReader(func() (io.ReadCloser, error) {
 		return c.startVzdump(ctx, args)
-	}), nil
+	})
 }
 
 func (c *Client) startVzdump(ctx context.Context, args []string) (io.ReadCloser, error) {
@@ -128,39 +108,12 @@ func (c *Client) readVMConfig(ctx context.Context, vmType string, vmid int) ([]b
 	return configData, nil
 }
 
-func dumpBaseExtension(vmType string) (string, error) {
-	switch vmType {
-	case "qemu":
-		return "vma", nil
-	case "lxc":
-		return "tar", nil
-	default:
-		return "", fmt.Errorf("unsupported VM type: %s", vmType)
-	}
-}
-
-// compressionSuffix maps vzdump's --compress value to the archive extension
-// vzdump itself would use.
-func compressionSuffix(compress string) (string, error) {
-	switch compress {
-	case "0":
-		return "", nil
-	case "1", "lzo":
-		return ".lzo", nil
-	case "gzip":
-		return ".gz", nil
-	case "zstd":
-		return ".zst", nil
-	default:
-		return "", fmt.Errorf("unsupported backup_compression: %q", compress)
-	}
-}
-
 type streamReadCloser struct {
 	stdout     io.Reader
 	finish     func() error
 	abort      func() error
 	release    func()
+	read       int64
 	eof        bool
 	stderr     *bytes.Buffer
 	stderrDone <-chan struct{}
@@ -171,10 +124,15 @@ type streamReadCloser struct {
 
 func (r *streamReadCloser) Read(p []byte) (int, error) {
 	n, err := r.stdout.Read(p)
+	r.read += int64(n)
 	if err == io.EOF {
 		r.eof = true
 		if finishErr := r.finalize(); finishErr != nil {
 			return n, finishErr
+		}
+		// vzdump exits 0 without output when the guest is not on this node.
+		if r.read == 0 {
+			return 0, fmt.Errorf("vzdump produced no data")
 		}
 	}
 	return n, err
@@ -185,10 +143,11 @@ func (r *streamReadCloser) Close() error {
 		return nil
 	}
 	r.closed = true
-	// Closed before EOF: vzdump would block writing to a pipe nobody reads,
-	// and waiting for it would never return.
+	// Closed before EOF: vzdump would block forever on a pipe nobody reads.
 	if !r.eof && r.abort != nil {
 		_ = r.abort()
+		// vzdump's tar must not block on a full pipe while it cleans up.
+		go func() { _, _ = io.Copy(io.Discard, r.stdout) }()
 	}
 	return r.finalize()
 }
@@ -199,12 +158,13 @@ func (r *streamReadCloser) finalize() error {
 	}
 	r.finished = true
 
+	// stderr is read to the end first: Wait closes the pipe and would cut the error message.
+	if r.stderrDone != nil {
+		<-r.stderrDone
+	}
 	var err error
 	if r.finish != nil {
 		err = r.finish()
-	}
-	if r.stderrDone != nil {
-		<-r.stderrDone
 	}
 	if r.release != nil {
 		r.release()

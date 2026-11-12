@@ -18,16 +18,15 @@ package proxmox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 )
 
-// FreeSpaceMargin is kept free on top of the size of a transfer, so filling
-// dump_dir never takes the node's filesystem down to its last block.
 const FreeSpaceMargin = 256 << 20
 
-// CheckCommands verifies the given Proxmox tools are reachable on the target.
 func (c *Client) CheckCommands(ctx context.Context, names ...string) error {
 	for _, name := range names {
 		if _, _, err := c.runner.Run(ctx, "sh", "-c", "command -v "+name+" >/dev/null 2>&1"); err != nil {
@@ -37,7 +36,93 @@ func (c *Client) CheckCommands(ctx context.Context, names ...string) error {
 	return nil
 }
 
-// CheckDumpDir verifies dump_dir exists and is writable.
+// vzdump --node naming another node exits 0 and does nothing.
+func (c *Client) CheckNode(ctx context.Context) error {
+	stdout, stderr, err := c.runner.Run(ctx, "uname", "-n")
+	if err != nil {
+		return fmt.Errorf("unable to read the node name: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	local, _, _ := strings.Cut(strings.TrimSpace(stdout), ".")
+	if c.cfg.Node != "" && c.cfg.Node != local {
+		return fmt.Errorf("node=%s, but %s is node %s: connect to the node that runs the guests", c.cfg.Node, c.cfg.Origin(), local)
+	}
+	c.cfg.Node = local
+	return nil
+}
+
+func (c *Client) CheckProvider(ctx context.Context) error {
+	stdout, err := c.runPvesh(ctx, "pvesh unavailable", "get", "/version", "--output-format", "json")
+	if err != nil {
+		return err
+	}
+	var v struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &v); err != nil {
+		return fmt.Errorf("unable to parse PVE version: %w", err)
+	}
+	if !atLeast(v.Version, 8, 4) {
+		return fmt.Errorf("QEMU backups need Proxmox VE 8.4 or later, %s runs %s", c.cfg.Origin(), v.Version)
+	}
+
+	stdout, stderr, err := c.runner.Run(ctx, "pvesm", "status", "--storage", ProviderStorage)
+	if err != nil || !storageActive(stdout, ProviderStorage) {
+		return fmt.Errorf("storage %q is missing or inactive on %s: install plakar-pve-provider and run `pvesm add plakar plakar`: %s",
+			ProviderStorage, c.cfg.Origin(), strings.TrimSpace(stderr+stdout))
+	}
+
+	// The provider reads disks over NBD, which vzdump refuses without fleecing.
+	if s := c.cfg.FleecingStorage; s != "" {
+		stdout, stderr, err := c.runner.Run(ctx, "pvesm", "status", "--storage", s)
+		if err != nil || !storageActive(stdout, s) {
+			return fmt.Errorf("fleecing_storage %q is missing or inactive on %s: %s", s, c.cfg.Origin(), strings.TrimSpace(stderr+stdout))
+		}
+	} else {
+		stdout, _, _ := c.runner.Run(ctx, "cat", "--", "/etc/vzdump.conf")
+		c.fleecingOnBootDisk = !fleecingEnabled(stdout)
+	}
+	return nil
+}
+
+func fleecingEnabled(conf string) bool {
+	for _, line := range strings.Split(conf, "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "fleecing:")
+		if !ok {
+			continue
+		}
+		for _, part := range strings.Split(value, ",") {
+			key, val, hasKey := strings.Cut(strings.TrimSpace(part), "=")
+			if !hasKey {
+				key, val = "enabled", key
+			}
+			if key == "enabled" {
+				switch strings.ToLower(strings.TrimSpace(val)) {
+				case "1", "yes", "true", "on":
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func atLeast(version string, major, minor int) bool {
+	var gotMajor, gotMinor int
+	if _, err := fmt.Sscanf(version, "%d.%d", &gotMajor, &gotMinor); err != nil {
+		return false
+	}
+	return gotMajor > major || (gotMajor == major && gotMinor >= minor)
+}
+
+func storageActive(output, storage string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if fields := strings.Fields(line); len(fields) >= 3 && fields[0] == storage {
+			return fields[2] == "active"
+		}
+	}
+	return false
+}
+
 func (c *Client) CheckDumpDir(ctx context.Context) error {
 	if _, _, err := c.runner.Run(ctx, "test", "-d", c.cfg.DumpDir); err != nil {
 		return fmt.Errorf("dump_dir %s does not exist on %s", c.cfg.DumpDir, c.cfg.Origin())
@@ -48,7 +133,6 @@ func (c *Client) CheckDumpDir(ctx context.Context) error {
 	return nil
 }
 
-// AvailableBytes reports the free space of the filesystem holding dir.
 func (c *Client) AvailableBytes(ctx context.Context, dir string) (int64, error) {
 	stdout, stderr, err := c.runner.Run(ctx, "df", "-Pk", dir)
 	if err != nil {
@@ -57,7 +141,6 @@ func (c *Client) AvailableBytes(ctx context.Context, dir string) (int64, error) 
 	return parseDfAvailable(stdout)
 }
 
-// EnsureFreeSpace refuses a transfer that dir cannot hold.
 func (c *Client) EnsureFreeSpace(ctx context.Context, dir string, size int64) error {
 	if size <= 0 {
 		return nil
@@ -65,7 +148,7 @@ func (c *Client) EnsureFreeSpace(ctx context.Context, dir string, size int64) er
 
 	available, err := c.AvailableBytes(ctx, dir)
 	if err != nil {
-		Warnf("unable to check free space on %s: %v", dir, err)
+		log.Printf("unable to check free space on %s: %v", dir, err)
 		return nil
 	}
 
@@ -77,7 +160,6 @@ func (c *Client) EnsureFreeSpace(ctx context.Context, dir string, size int64) er
 	return nil
 }
 
-// parseDfAvailable reads the "Available" column of POSIX df output, in 1K units.
 func parseDfAvailable(output string) (int64, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 2 {
