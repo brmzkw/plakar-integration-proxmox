@@ -212,7 +212,7 @@ func TestProviderRestore(t *testing.T) {
 	manifest := `{"version":2,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"scsi0":{"size":4}},"pool":"prod"}`
 
 	r, err := client.PrepareProviderRestore(context.Background(),
-		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})))
+		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestProviderRestoreRejectsUnlistedDisk(t *testing.T) {
 	manifest := `{"version":2,"vmid":100,"devices":{"scsi0":{"size":4}}}`
 
 	_, err := client.PrepareProviderRestore(context.Background(),
-		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi1.raw": []byte("disk")})))
+		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi1.raw": []byte("disk")})), nil)
 	if err == nil || !strings.Contains(err.Error(), "unexpected entry") {
 		t.Fatalf("got %v", err)
 	}
@@ -285,5 +285,25 @@ func TestFleecingStorage(t *testing.T) {
 		if got := tc.client.fleecingStorage(context.Background(), 100); got != tc.want {
 			t.Errorf("%s: got %q, want %q", name, got, tc.want)
 		}
+	}
+}
+
+func TestProviderRestoreCheckRunsBeforeUpload(t *testing.T) {
+	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
+	client := &Client{cfg: &Config{DumpDir: "/dump"}, runner: runner}
+	manifest := `{"version":2,"vmid":100,"devices":{"scsi0":{"size":4}}}`
+
+	var checked int
+	_, err := client.PrepareProviderRestore(context.Background(),
+		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})),
+		func(m ProviderManifest) error {
+			checked = m.VMID
+			return errors.New("target exists")
+		})
+	if err == nil || err.Error() != "target exists" || checked != 100 {
+		t.Fatalf("got %v, checked vmid %d", err, checked)
+	}
+	if len(runner.files) != 0 {
+		t.Fatal("nothing must be uploaded when the target is refused")
 	}
 }

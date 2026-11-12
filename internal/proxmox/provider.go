@@ -306,16 +306,16 @@ type ProviderRestore struct {
 	pidFiles []string
 }
 
-func (c *Client) PrepareProviderRestore(ctx context.Context, archive io.Reader) (*ProviderRestore, error) {
+func (c *Client) PrepareProviderRestore(ctx context.Context, archive io.Reader, check func(ProviderManifest) error) (*ProviderRestore, error) {
 	r := &ProviderRestore{c: c}
-	if err := r.prepare(ctx, archive); err != nil {
+	if err := r.prepare(ctx, archive, check); err != nil {
 		r.Close()
 		return nil, err
 	}
 	return r, nil
 }
 
-func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader) error {
+func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader, check func(ProviderManifest) error) error {
 	tr := tar.NewReader(archive)
 
 	hdr, err := tr.Next()
@@ -334,6 +334,11 @@ func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader) error 
 	}
 	if err := r.Manifest.Validate(); err != nil {
 		return err
+	}
+	if check != nil {
+		if err := check(r.Manifest); err != nil {
+			return err
+		}
 	}
 
 	stamp := time.Now().Unix()

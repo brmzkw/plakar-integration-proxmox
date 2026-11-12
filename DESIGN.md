@@ -46,9 +46,10 @@ records waiting on one shared vzdump session could never be read.
 
 ## Restore (exporter)
 
-Records are read in order. Sidecars are collected, and LXC archives are uploaded to `dump_dir`
-(after a free-space check) and restored once every record has been read. QEMU tars are restored as
-they arrive.
+Records are read in order. A guest whose target VMID already exists is refused before anything is
+uploaded, unless `force_vm_restore` is set. Sidecars are collected, and LXC archives are uploaded to
+`dump_dir` (after a free-space check) and restored once every record has been read. QEMU tars are
+restored as they arrive; their disks are written sparse, so there is no free-space check up front.
 
 For each guest:
 

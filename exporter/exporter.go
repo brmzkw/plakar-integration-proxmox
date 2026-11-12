@@ -171,6 +171,10 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
+		if err := p.checkTarget(ctx, vmType, p.targetVMID(vmid)); err != nil {
+			results <- record.Error(err)
+			continue
+		}
 		if err := p.client.EnsureFreeSpace(ctx, p.cfg.DumpDir, record.FileInfo.Lsize); err != nil {
 			results <- record.Error(err)
 			continue
@@ -241,11 +245,9 @@ func (p *ProxmoxExporter) restoreProvider(ctx context.Context, record *connector
 		_ = closeRecord(record)
 		return err
 	}
-	if err := p.client.EnsureFreeSpace(ctx, p.cfg.DumpDir, record.FileInfo.Lsize); err != nil {
-		_ = closeRecord(record)
-		return err
-	}
-	session, err := p.client.PrepareProviderRestore(ctx, record.Reader)
+	session, err := p.client.PrepareProviderRestore(ctx, record.Reader, func(m proxmox.ProviderManifest) error {
+		return p.checkTarget(ctx, "qemu", p.targetVMID(m.VMID))
+	})
 	if closeErr := closeRecord(record); err == nil && closeErr != nil {
 		session.Close()
 		return closeErr
@@ -255,11 +257,7 @@ func (p *ProxmoxExporter) restoreProvider(ctx context.Context, record *connector
 	}
 	defer session.Close()
 
-	targetVMID := session.Manifest.VMID
-	if p.restoreOpts.newID != 0 {
-		targetVMID = p.restoreOpts.newID
-	}
-	return p.restoreDump(ctx, session.Volume, "qemu", targetVMID, []byte(session.Manifest.GuestConfig), session.Manifest.Pool)
+	return p.restoreDump(ctx, session.Volume, "qemu", p.targetVMID(session.Manifest.VMID), []byte(session.Manifest.GuestConfig), session.Manifest.Pool)
 }
 
 func (p *ProxmoxExporter) Close(ctx context.Context) error {
@@ -324,6 +322,31 @@ func (p *ProxmoxExporter) resolvePoolForDump(pending pendingRestore, sidecars ma
 	return strings.TrimSpace(poolName), nil
 }
 
+func (p *ProxmoxExporter) targetVMID(vmid int) int {
+	if p.restoreOpts.newID != 0 {
+		return p.restoreOpts.newID
+	}
+	return vmid
+}
+
+func (p *ProxmoxExporter) errTargetExists(vmType string, vmid int) error {
+	return fmt.Errorf("refusing restore for %s %d: it already exists on %s (pass -o force_vm_restore=true to overwrite it, or -o newid=<id> to restore next to it)", vmType, vmid, p.cfg.Origin())
+}
+
+func (p *ProxmoxExporter) checkTarget(ctx context.Context, vmType string, vmid int) error {
+	if p.restoreOpts.forceVMRestore {
+		return nil
+	}
+	state, err := p.vmState(ctx, vmType, vmid)
+	if err != nil {
+		return err
+	}
+	if state.exists {
+		return p.errTargetExists(vmType, vmid)
+	}
+	return nil
+}
+
 func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte, poolName string) error {
 	state, err := p.vmState(ctx, vmType, vmid)
 	if err != nil {
@@ -337,7 +360,7 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 
 	if state.exists {
 		if !p.restoreOpts.forceVMRestore {
-			return fmt.Errorf("refusing restore for %s %d: it already exists on %s (pass -o force_vm_restore=true to overwrite it, or -o newid=<id> to restore next to it)", vmType, vmid, p.cfg.Origin())
+			return p.errTargetExists(vmType, vmid)
 		}
 
 		if state.running {
