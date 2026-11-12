@@ -172,6 +172,10 @@ func (c *Client) startProviderBackup(ctx context.Context, vmid int) (*providerBa
 	sockPath := path.Join(ProviderSessionRoot, session+".sock")
 
 	c.vzdumpMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.vzdumpMu.Unlock()
+		return nil, err
+	}
 	ln, err := c.runner.ListenUnix(sockPath)
 	if err != nil {
 		c.vzdumpMu.Unlock()

@@ -43,6 +43,10 @@ func (c *Client) BackupLXCStream(ctx context.Context, vmid int) (string, io.Read
 
 func (c *Client) startVzdump(ctx context.Context, args []string) (io.ReadCloser, error) {
 	c.vzdumpMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.vzdumpMu.Unlock()
+		return nil, err
+	}
 	stream, err := c.runner.Stream(ctx, "vzdump", args...)
 	if err != nil {
 		c.vzdumpMu.Unlock()
