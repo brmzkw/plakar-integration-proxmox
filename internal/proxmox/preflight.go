@@ -70,6 +70,9 @@ func (c *Client) CheckProvider(ctx context.Context) error {
 		return fmt.Errorf("storage %q is missing or inactive on %s: install plakar-pve-provider and run `pvesm add plakar plakar`: %s",
 			ProviderStorage, c.cfg.Origin(), strings.TrimSpace(stderr+stdout))
 	}
+	if err := c.checkProviderProtocol(ctx); err != nil {
+		return err
+	}
 
 	// The provider reads disks over NBD, which vzdump refuses without fleecing.
 	if s := c.cfg.FleecingStorage; s != "" {
@@ -80,6 +83,17 @@ func (c *Client) CheckProvider(ctx context.Context) error {
 	} else {
 		stdout, _, _ := c.runner.Run(ctx, "cat", "--", "/etc/vzdump.conf")
 		c.fleecingOnBootDisk = !fleecingEnabled(stdout)
+	}
+	return nil
+}
+
+func (c *Client) checkProviderProtocol(ctx context.Context) error {
+	stdout, _, err := c.runner.Run(ctx, "cat", "--", ProviderProtocolFile)
+	if err != nil {
+		return fmt.Errorf("plakar-pve-provider on %s does not publish its protocol (%s missing): upgrade it", c.cfg.Origin(), ProviderProtocolFile)
+	}
+	if got := strings.TrimSpace(stdout); got != strconv.Itoa(ProviderManifestVersion) {
+		return fmt.Errorf("plakar-pve-provider on %s speaks protocol %s, this integration needs %d: install matching versions", c.cfg.Origin(), got, ProviderManifestVersion)
 	}
 	return nil
 }

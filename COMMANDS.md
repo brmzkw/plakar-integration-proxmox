@@ -27,7 +27,7 @@ else is executed.
 | `uname -n` | start of the job | name of the connected node |
 | `pvesh get /pools --poolid <pool> --output-format json` | `pool=<pool>` | VMs and CTs of the pool |
 | `pvesh get /cluster/resources --type vm --output-format json` | once per job (cached 15 s) | VM/CT list for `all`, and the type, name, node and pool of each |
-| `pvesh get /version --output-format json`, `pvesm status --storage plakar` | a QEMU VM is selected | PVE 8.4 or later, provider storage active |
+| `pvesh get /version --output-format json`, `pvesm status --storage plakar`, `cat -- /usr/share/plakar-pve-provider/protocol` | a QEMU VM is selected | PVE 8.4 or later, provider storage active, same protocol as the provider |
 | `pvesm status --storage <fleecing_storage>`, or `cat -- /etc/vzdump.conf` without it | a QEMU VM is selected | fleecing storage active, or whether the node defaults enable fleecing |
 | `cat -- /etc/pve/qemu-server/<vmid>.conf` | each QEMU VM, when neither gives a fleecing storage | boot disk storage, used for fleecing |
 | `cat -- /etc/pve/lxc/<vmid>.conf` | each LXC CT | `_lxc.conf` sidecar |
@@ -41,7 +41,7 @@ else is executed.
 |---|---|---|
 | `sh -c 'command -v <tool> >/dev/null 2>&1'` for `pvesh`, `qm`, `pct`, `qmrestore` | start of the job | tools present |
 | `test -d <dump_dir>`, `test -w <dump_dir>` | start of the job | `dump_dir` exists and is writable |
-| `pvesh get /version --output-format json`, `pvesm status --storage plakar` | each QEMU VM | PVE 8.4 or later, provider storage active |
+| `pvesh get /version --output-format json`, `pvesm status --storage plakar`, `cat -- /usr/share/plakar-pve-provider/protocol` | each QEMU VM | PVE 8.4 or later, provider storage active, same protocol as the provider |
 | `df -Pk <dump_dir>` | before each LXC upload | enough free space |
 | `dd of=<dump_dir>/<archive> bs=1M iflag=fullblock conv=sparse status=none` | each LXC archive | upload the archive |
 | `dd of=<dump_dir>/plakar-<time>-<device>.raw ...` (as above) | each QEMU disk | upload the disk image, sparse |

@@ -43,6 +43,8 @@ import (
 
 const ProviderManifestVersion = 2
 
+const ProviderProtocolFile = "/usr/share/plakar-pve-provider/protocol"
+
 const (
 	ProviderManifestFile = "manifest.json"
 	ProviderGuestFile    = "guest.conf"

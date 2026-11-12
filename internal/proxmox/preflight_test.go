@@ -18,7 +18,9 @@ package proxmox
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gillesdubois/plakar-integration-proxmox/internal/runner"
@@ -89,6 +91,32 @@ func TestFleecingEnabled(t *testing.T) {
 	} {
 		if got := fleecingEnabled(conf); got != want {
 			t.Errorf("fleecingEnabled(%q) = %v", conf, got)
+		}
+	}
+}
+
+type catRunner struct {
+	runner.Local
+	out string
+	err error
+}
+
+func (r *catRunner) Run(context.Context, string, ...string) (string, string, error) {
+	return r.out, "", r.err
+}
+
+func TestCheckProviderProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		runner  *catRunner
+		wantErr string
+	}{
+		{&catRunner{out: "2\n"}, ""},
+		{&catRunner{out: "1\n"}, "speaks protocol 1, this integration needs 2"},
+		{&catRunner{err: errors.New("exit status 1")}, "does not publish its protocol"},
+	} {
+		err := (&Client{cfg: &Config{}, runner: tc.runner}).checkProviderProtocol(context.Background())
+		if (tc.wantErr == "" && err != nil) || (tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr))) {
+			t.Errorf("out %q: got %v, want %q", tc.runner.out, err, tc.wantErr)
 		}
 	}
 }
