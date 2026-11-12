@@ -61,7 +61,7 @@ func (r *fakeProviderRunner) Stream(_ context.Context, name string, args ...stri
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		fmt.Fprintf(conn, `{"version":2,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"drive-scsi0":{"size":%d,"nbd-path":%q,"export":"drive-scsi0"}}}`+"\n", r.size, r.nbdPath)
+		_, _ = fmt.Fprintf(conn, `{"version":2,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"drive-scsi0":{"size":%d,"nbd-path":%q,"export":"drive-scsi0"}}}`+"\n", r.size, r.nbdPath)
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		r.reply <- line
 		if err == nil && !strings.Contains(line, `"ok"`) {

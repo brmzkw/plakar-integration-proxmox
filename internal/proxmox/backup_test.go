@@ -81,8 +81,8 @@ func TestOneVzdumpAtATime(t *testing.T) {
 	}()
 
 	select {
-	case <-secondDone:
-		t.Fatal("second vzdump started while the first one was still streaming")
+	case err := <-secondDone:
+		t.Fatalf("second vzdump started while the first one was still streaming (err: %v)", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 

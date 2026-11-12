@@ -217,7 +217,7 @@ func (r *SSH) withRetry(ctx context.Context, op func(*ssh.Client) error) error {
 			return ctx.Err()
 		}
 		if err := r.reconnect(client); err != nil {
-			lastErr = fmt.Errorf("ssh reconnect failed: %w", err)
+			log.Printf("ssh reconnect failed: %v", err)
 		}
 	}
 }

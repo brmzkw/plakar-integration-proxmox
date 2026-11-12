@@ -178,18 +178,6 @@ func (c *Config) Origin() string {
 	return "local"
 }
 
-func parseBool(config map[string]string, key string, defaultValue bool) (bool, error) {
-	value := strings.TrimSpace(config[key])
-	if value == "" {
-		return defaultValue, nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("invalid %s value: %s", key, value)
-	}
-	return parsed, nil
-}
-
 func parseInt(config map[string]string, key string, defaultValue int) (int, error) {
 	value := strings.TrimSpace(config[key])
 	if value == "" {
