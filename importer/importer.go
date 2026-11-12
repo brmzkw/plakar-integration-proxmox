@@ -204,7 +204,6 @@ func (p *ProxmoxImporter) checkProvider(ctx context.Context, vmids []int) error 
 	return nil
 }
 
-// One record per VM: several records waiting on one vzdump session would deadlock.
 func (p *ProxmoxImporter) importVMProvider(ctx context.Context, records chan<- *connectors.Record, vmid int, vmName string) error {
 	pool, err := p.client.VMPool(ctx, vmid)
 	if err != nil {

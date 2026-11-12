@@ -96,7 +96,6 @@ func (c *Client) PoolExists(ctx context.Context, pool string) (bool, error) {
 	return false, nil
 }
 
-// /pools/<id> is deprecated since PVE 8.1 and cannot address nested pools.
 func (c *Client) ListPoolVMIDs(ctx context.Context, pool string) ([]int, error) {
 	stdout, err := c.runPvesh(ctx, "pvesh get pool failed", "get", "/pools", "--poolid", pool, "--output-format", "json")
 	if err != nil {

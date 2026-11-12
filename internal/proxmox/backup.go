@@ -32,8 +32,6 @@ import (
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
-// vzdump starts on the first Read: started earlier, it would hold the node-wide
-// vzdump lock while its record still waits in plakar's queue.
 func (c *Client) BackupLXCStream(ctx context.Context, vmid int) (string, io.ReadCloser) {
 	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", "0"}
 	archiveName := fmt.Sprintf("vzdump-lxc-%d-%s.tar", vmid, time.Now().Format("2006_01_02-15_04_05"))
@@ -130,7 +128,6 @@ func (r *streamReadCloser) Read(p []byte) (int, error) {
 		if finishErr := r.finalize(); finishErr != nil {
 			return n, finishErr
 		}
-		// vzdump exits 0 without output when the guest is not on this node.
 		if r.read == 0 {
 			return 0, fmt.Errorf("vzdump produced no data")
 		}
@@ -143,10 +140,8 @@ func (r *streamReadCloser) Close() error {
 		return nil
 	}
 	r.closed = true
-	// Closed before EOF: vzdump would block forever on a pipe nobody reads.
 	if !r.eof && r.abort != nil {
 		_ = r.abort()
-		// vzdump's tar must not block on a full pipe while it cleans up.
 		go func() { _, _ = io.Copy(io.Discard, r.stdout) }()
 	}
 	return r.finalize()
@@ -158,7 +153,6 @@ func (r *streamReadCloser) finalize() error {
 	}
 	r.finished = true
 
-	// stderr is read to the end first: Wait closes the pipe and would cut the error message.
 	if r.stderrDone != nil {
 		<-r.stderrDone
 	}

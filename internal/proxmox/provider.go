@@ -369,7 +369,6 @@ func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader) error 
 	if err != nil {
 		return err
 	}
-	// manifest.json is what the provider looks for: write it last.
 	for _, name := range []string{ProviderGuestFile, ProviderFirewallFile, ProviderManifestFile} {
 		if data, ok := files[name]; ok {
 			if err := r.writeFile(ctx, path.Join(r.dir, name), bytes.NewReader(data)); err != nil {

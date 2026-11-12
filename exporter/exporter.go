@@ -336,7 +336,6 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	}
 
 	if state.exists {
-		// Overwriting destroys the current disks: always require the explicit opt-in.
 		if !p.restoreOpts.forceVMRestore {
 			return fmt.Errorf("refusing restore for %s %d: it already exists on %s (pass -o force_vm_restore=true to overwrite it, or -o newid=<id> to restore next to it)", vmType, vmid, p.cfg.Origin())
 		}
@@ -663,7 +662,6 @@ var missingVMPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bno such (vm|container)\b`),
 }
 
-// A loose match would read a permission or quorum error as a free VMID and overwrite a live VM.
 func isMissingVMError(output string) bool {
 	if strings.TrimSpace(output) == "" {
 		return false

@@ -22,7 +22,6 @@ import (
 	"strings"
 )
 
-// efidisk0 and tpmstate0 are auxiliary volumes, not guest disks.
 var qemuDiskKeyRegex = regexp.MustCompile(`^(scsi|virtio|sata|ide|nvme)\d+$`)
 
 func StorageFromConfig(vmType string, configData []byte) string {

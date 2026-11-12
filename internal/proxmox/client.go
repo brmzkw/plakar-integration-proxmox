@@ -31,7 +31,6 @@ type Client struct {
 	cfg    *Config
 	runner runner.Runner
 
-	// The others would sit on the node lock, which gives up after lockwait (3h).
 	vzdumpMu sync.Mutex
 
 	fleecingOnBootDisk bool
