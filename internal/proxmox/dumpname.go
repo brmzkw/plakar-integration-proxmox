@@ -64,7 +64,7 @@ func ParseDumpFilename(name string) (string, int, error) {
 
 func BuildRestoreDumpFilename(originalName, vmType string, vmid int, now time.Time) string {
 	suffix := canonicalArchiveSuffix(originalName, vmType)
-	return fmt.Sprintf("vzdump-%s-%d-%s%s", vmType, vmid, now.Format("2006_01_02-15_04_05"), suffix)
+	return fmt.Sprintf("vzdump-%s-%d-%s%s", vmType, vmid, now.Format(DumpTimeFormat), suffix)
 }
 
 func DumpLogPath(archivePath string) string {

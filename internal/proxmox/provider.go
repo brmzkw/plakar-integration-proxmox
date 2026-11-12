@@ -56,10 +56,10 @@ const (
 
 var providerDeviceRegex = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9_.-]*$`)
 
-var ProviderArchiveRegex = regexp.MustCompile(`^qemu-\d+\.tar$`)
+var ProviderArchiveRegex = regexp.MustCompile(`^qemu-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}\.tar$`)
 
 func ProviderArchiveName(t time.Time) string {
-	return fmt.Sprintf("qemu-%d.tar", t.Unix())
+	return "qemu-" + t.Format(DumpTimeFormat) + ".tar"
 }
 
 type ProviderDevice struct {

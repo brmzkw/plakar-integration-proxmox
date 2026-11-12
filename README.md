@@ -128,6 +128,8 @@ Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them i
 /backup/qemu/<vmid>_<name>/qemu-<time>.tar                        manifest.json (config, pool) + one <device>.raw per disk
 ```
 
+`<time>` is the backup start time on the machine running Plakar, as `YYYY_MM_DD-HH_MM_SS`.
+
 ## Disk space
 
 - A restore needs room in `dump_dir` for the whole archive (all disks of a QEMU VM) on the node.

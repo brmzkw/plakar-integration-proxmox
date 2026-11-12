@@ -16,7 +16,10 @@
 
 package proxmox
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseSidecarFilename(t *testing.T) {
 	cases := []struct{ name, archive, kind string }{
@@ -36,5 +39,15 @@ func TestParseSidecarFilename(t *testing.T) {
 	}
 	if _, _, ok := ParseSidecarFilename("vzdump-lxc-1-x.tar.zst"); ok {
 		t.Error("an archive is not a sidecar")
+	}
+}
+
+func TestProviderArchiveName(t *testing.T) {
+	name := ProviderArchiveName(time.Date(2026, 11, 12, 14, 40, 38, 0, time.UTC))
+	if name != "qemu-2026_11_12-14_40_38.tar" || !ProviderArchiveRegex.MatchString(name) {
+		t.Fatalf("got %q", name)
+	}
+	if ProviderArchiveRegex.MatchString("qemu-1762954838.tar") {
+		t.Fatal("the old epoch name must not match")
 	}
 }

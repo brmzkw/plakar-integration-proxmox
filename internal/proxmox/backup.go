@@ -29,12 +29,14 @@ import (
 	"github.com/PlakarKorp/kloset/connectors"
 )
 
+const DumpTimeFormat = "2006_01_02-15_04_05"
+
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
 func (c *Client) BackupLXCStream(ctx context.Context, vmid int) (string, io.ReadCloser) {
 	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", "0"}
-	archiveName := fmt.Sprintf("vzdump-lxc-%d-%s.tar", vmid, time.Now().Format("2006_01_02-15_04_05"))
+	archiveName := fmt.Sprintf("vzdump-lxc-%d-%s.tar", vmid, time.Now().Format(DumpTimeFormat))
 
 	return archiveName, connectors.NewLazyReader(func() (io.ReadCloser, error) {
 		return c.startVzdump(ctx, args)
