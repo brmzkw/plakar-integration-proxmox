@@ -271,16 +271,21 @@ func alive(c *ssh.Client) bool {
 	}
 }
 
-// Closing the channel alone does not signal a command running without a tty.
 func terminate(session *ssh.Session) {
 	if err := session.Signal(ssh.SIGTERM); err != nil {
 		_ = session.Close()
 		return
 	}
-	time.AfterFunc(killDelay, func() { _ = session.Close() })
+	time.AfterFunc(killDelay, func() {
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+	})
 }
 
 func (r *SSH) Run(ctx context.Context, name string, args ...string) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	session, err := r.newSession(ctx)
 	if err != nil {
 		return "", "", err
@@ -293,15 +298,20 @@ func (r *SSH) Run(ctx context.Context, name string, args ...string) (string, str
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
-	cmd := shellCommand(name, args...)
+	if err := session.Start(shellCommand(name, args...)); err != nil {
+		return "", "", err
+	}
 	stop := context.AfterFunc(ctx, func() { terminate(session) })
 	defer stop()
 
-	err = session.Run(cmd)
+	err = session.Wait()
 	return stdout.String(), stderr.String(), err
 }
 
 func (r *SSH) Stream(ctx context.Context, name string, args ...string) (*CommandStream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	session, err := r.newSession(ctx)
 	if err != nil {
 		return nil, err
