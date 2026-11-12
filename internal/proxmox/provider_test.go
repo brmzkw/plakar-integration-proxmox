@@ -226,10 +226,11 @@ func TestProviderRestore(t *testing.T) {
 	if !strings.HasPrefix(image, "/var/lib/vz/dump/plakar-") || runner.files[image].String() != "disk" {
 		t.Fatalf("image %s not uploaded to dump_dir", image)
 	}
-	want := strings.Join([]string{"qemu-nbd", "--fork", "--persistent", "--read-only", "--format", "raw", "--export-name", "scsi0",
-		"--pid-file", image + ".pid", "--socket", session + "/scsi0.sock", image}, " ")
-	if len(runner.commands) != 2 || runner.commands[1] != want {
-		t.Fatalf("commands %q, want qemu-nbd %q", runner.commands, want)
+	if len(runner.commands) != 1 || !strings.HasPrefix(runner.commands[0], "mkdir ") {
+		t.Fatalf("commands %q, want only mkdir", runner.commands)
+	}
+	if !strings.Contains(runner.files[session+"/manifest.json"].String(), `"image": "`+image+`"`) {
+		t.Fatalf("manifest.json must give the image path: %s", runner.files[session+"/manifest.json"])
 	}
 	if last := runner.order[len(runner.order)-1]; last != session+"/manifest.json" {
 		t.Fatalf("manifest.json must be written last, got %s", last)
@@ -240,10 +241,10 @@ func TestProviderRestore(t *testing.T) {
 
 	r.Close()
 	cleanup := strings.Join(runner.commands, "\n")
-	if !strings.Contains(cleanup, "pkill -F "+image+".pid") || !strings.Contains(cleanup, "rm -rf -- "+session) {
+	if !strings.Contains(cleanup, "rm -rf -- "+session) {
 		t.Fatalf("cleanup commands %q", runner.commands)
 	}
-	if strings.Join(runner.removed, ",") != image+".pid,"+image {
+	if strings.Join(runner.removed, ",") != image {
 		t.Fatalf("removed %v", runner.removed)
 	}
 }

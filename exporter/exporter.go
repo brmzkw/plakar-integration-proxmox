@@ -115,7 +115,7 @@ func (p *ProxmoxExporter) Ping(ctx context.Context) error {
 }
 
 func (p *ProxmoxExporter) preflight(ctx context.Context) error {
-	if err := p.client.CheckCommands(ctx, "pvesh", "qm", "pct", "qmrestore", "qemu-nbd"); err != nil {
+	if err := p.client.CheckCommands(ctx, "pvesh", "qm", "pct", "qmrestore"); err != nil {
 		return err
 	}
 	return p.client.CheckDumpDir(ctx)

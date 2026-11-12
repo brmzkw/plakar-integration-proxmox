@@ -71,11 +71,12 @@ Plakar reads the tar in order. Each disk image is uploaded to `dump_dir`, writte
 the data takes room. Plakar then:
 
 - creates the session `/run/plakar/plakar/restore/<vmid>-qemu-<time>/` (`manifest.json` last,
-  since the provider looks for it, `guest.conf`, `firewall.conf`);
-- serves each image read-only with `qemu-nbd` on `<device>.sock`;
-- runs `qmrestore plakar:<vmid>/qemu-<time> <vmid>`.
+  since the provider looks for it, `guest.conf`, `firewall.conf`); `manifest.json` gives each
+  image path (`devices.<device>.image`);
+- runs `qmrestore plakar:<vmid>/qemu-<time> <vmid>`. The provider hands each image path to
+  `qemu-img`, which skips the holes of the sparse image.
 
-Afterwards `qemu-nbd` is stopped and the images and session are removed.
+Afterwards the images and session are removed.
 
 ## Cancellation
 

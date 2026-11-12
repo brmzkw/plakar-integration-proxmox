@@ -39,14 +39,13 @@ else is executed.
 
 | Command | When | Purpose |
 |---|---|---|
-| `sh -c 'command -v <tool> >/dev/null 2>&1'` for `pvesh`, `qm`, `pct`, `qmrestore`, `qemu-nbd` | start of the job | tools present |
+| `sh -c 'command -v <tool> >/dev/null 2>&1'` for `pvesh`, `qm`, `pct`, `qmrestore` | start of the job | tools present |
 | `test -d <dump_dir>`, `test -w <dump_dir>` | start of the job | `dump_dir` exists and is writable |
 | `pvesh get /version --output-format json`, `pvesm status --storage plakar` | each QEMU VM | PVE 8.4 or later, provider storage active |
 | `df -Pk <dump_dir>` | before each LXC upload | enough free space |
 | `dd of=<dump_dir>/<archive> bs=1M iflag=fullblock conv=sparse status=none` | each LXC archive | upload the archive |
 | `dd of=<dump_dir>/plakar-<time>-<device>.raw ...` (as above) | each QEMU disk | upload the disk image, sparse |
 | `mkdir -p -m 0700 -- <session>`, `dd of=<session>/{guest.conf,firewall.conf,manifest.json} ...` | each QEMU VM | prepare the restore session |
-| `qemu-nbd --fork --persistent --read-only --format raw --export-name <device> --pid-file <image>.pid --socket <session>/<device>.sock <image>` | each QEMU disk | serve the image to the provider |
 | `qm status <vmid>` / `pct status <vmid>` | each guest, before its upload and again before the restore | target exists? running? |
 | `pvesh get /pools --output-format json` | a pool is recorded or `pool` is set | the pool exists |
 | `qm stop <vmid>` / `pct stop <vmid>` | `force_vm_restore=true` and target running | stop before overwrite |
@@ -55,7 +54,7 @@ else is executed.
 | `cat -- /etc/pve/qemu-server/<vmid>.conf`, `qm set <vmid> --smbios1 uuid=<new>,...` | QEMU, when `unique` applies | new SMBIOS UUID |
 | `qm start <vmid>` / `pct start <vmid>` | `start_on_restore=true` | start after restore |
 | `rm -f -- <dump_dir>/<archive>` | after each LXC CT, success or not | remove the uploaded archive |
-| `pkill -F <image>.pid`, `rm -f -- <image>.pid <image>`, `rm -rf -- <session>` | after each QEMU VM, success or not | stop `qemu-nbd` and clean up |
+| `rm -f -- <image>`, `rm -rf -- <session>` | after each QEMU VM, success or not | clean up |
 
 ## Files touched on the node
 

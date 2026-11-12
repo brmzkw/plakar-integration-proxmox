@@ -63,6 +63,7 @@ func ProviderArchiveName(t time.Time) string {
 type ProviderDevice struct {
 	Size    int64  `json:"size"`
 	NBDPath string `json:"nbd-path,omitempty"`
+	Image   string `json:"image,omitempty"`
 }
 
 type ProviderManifest struct {
@@ -107,7 +108,7 @@ func (m *ProviderManifest) Stored() ([]byte, error) {
 	stored := *m
 	stored.Devices = make(map[string]ProviderDevice, len(m.Devices))
 	for name, dev := range m.Devices {
-		stored.Devices[name] = ProviderDevice{Size: dev.Size}
+		stored.Devices[name] = ProviderDevice{Size: dev.Size, Image: dev.Image}
 	}
 	return json.MarshalIndent(&stored, "", "  ")
 }
@@ -300,10 +301,9 @@ type ProviderRestore struct {
 	Volume   string
 	Manifest ProviderManifest
 
-	c        *Client
-	dir      string
-	images   []string
-	pidFiles []string
+	c      *Client
+	dir    string
+	images []string
 }
 
 func (c *Client) PrepareProviderRestore(ctx context.Context, archive io.Reader, check func(ProviderManifest) error) (*ProviderRestore, error) {
@@ -361,7 +361,7 @@ func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader, check 
 		if dev, listed := r.Manifest.Devices[device]; !ok || !listed || served[device] || dev.Size != hdr.Size {
 			return fmt.Errorf("invalid provider archive: unexpected entry %s", hdr.Name)
 		}
-		if err := r.serveDisk(ctx, device, tr); err != nil {
+		if err := r.uploadDisk(ctx, device, tr); err != nil {
 			return err
 		}
 		served[device] = true
@@ -388,20 +388,16 @@ func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader, check 
 	return nil
 }
 
-func (r *ProviderRestore) serveDisk(ctx context.Context, device string, data io.Reader) error {
+func (r *ProviderRestore) uploadDisk(ctx context.Context, device string, data io.Reader) error {
 	image := path.Join(r.c.cfg.DumpDir, fmt.Sprintf("plakar-%d-%s%s", time.Now().UnixNano(), device, ProviderDiskSuffix))
 	r.images = append(r.images, image)
 	if err := r.writeFile(ctx, image, data); err != nil {
 		return fmt.Errorf("unable to upload %s to %s: %w", device, image, err)
 	}
 
-	pidFile := image + ".pid"
-	r.pidFiles = append(r.pidFiles, pidFile)
-	_, stderr, err := r.c.runner.Run(ctx, "qemu-nbd", "--fork", "--persistent", "--read-only", "--format", "raw",
-		"--export-name", device, "--pid-file", pidFile, "--socket", path.Join(r.dir, device+".sock"), image)
-	if err != nil {
-		return fmt.Errorf("unable to serve device %s: %w: %s", device, err, strings.TrimSpace(stderr))
-	}
+	dev := r.Manifest.Devices[device]
+	dev.Image = image
+	r.Manifest.Devices[device] = dev
 	return nil
 }
 
@@ -419,10 +415,6 @@ func (r *ProviderRestore) writeFile(ctx context.Context, filepath string, data i
 
 func (r *ProviderRestore) Close() {
 	ctx := context.Background()
-	for _, pidFile := range r.pidFiles {
-		_, _, _ = r.c.runner.Run(ctx, "pkill", "-F", pidFile)
-		_ = r.c.runner.Remove(ctx, pidFile)
-	}
 	if r.dir != "" {
 		_, _, _ = r.c.runner.Run(ctx, "rm", "-rf", "--", r.dir)
 	}
