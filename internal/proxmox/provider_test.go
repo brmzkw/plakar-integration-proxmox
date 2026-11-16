@@ -40,6 +40,7 @@ type fakeProviderRunner struct {
 	root, nbdPath string
 	size          int64
 	reply         chan string
+	progress      []string
 }
 
 func (r *fakeProviderRunner) ListenUnix(socketPath string) (net.Listener, error) {
@@ -61,8 +62,16 @@ func (r *fakeProviderRunner) Stream(_ context.Context, name string, args ...stri
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		_, _ = fmt.Fprintf(conn, `{"version":2,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"drive-scsi0":{"size":%d,"nbd-path":%q,"export":"drive-scsi0"}}}`+"\n", r.size, r.nbdPath)
-		line, err := bufio.NewReader(conn).ReadString('\n')
+		_, _ = fmt.Fprintf(conn, `{"version":1,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"drive-scsi0":{"size":%d,"nbd-path":%q,"export":"drive-scsi0"}}}`+"\n", r.size, r.nbdPath)
+		br := bufio.NewReader(conn)
+		var line string
+		for {
+			line, err = br.ReadString('\n')
+			if err != nil || !strings.HasPrefix(line, `{"progress"`) {
+				break
+			}
+			r.progress = append(r.progress, line)
+		}
 		r.reply <- line
 		if err == nil && !strings.Contains(line, `"ok"`) {
 			err = errors.New("provider got an error reply")
@@ -116,6 +125,9 @@ func TestProviderBackupStream(t *testing.T) {
 
 	if reply := <-runner.reply; !strings.Contains(reply, `"ok"`) {
 		t.Fatalf("provider reply %q", reply)
+	}
+	if want := fmt.Sprintf(`{"progress":{"device":"drive-scsi0","read":%d,"total":%d}}`+"\n", len(data), len(data)); len(runner.progress) != 1 || runner.progress[0] != want {
+		t.Fatalf("progress lines %q, want %q", runner.progress, want)
 	}
 	if left, _ := filepath.Glob(filepath.Join(runner.root, "*.sock")); len(left) != 0 {
 		t.Fatalf("session socket left behind: %v", left)
@@ -209,7 +221,7 @@ func providerArchive(t *testing.T, manifest string, disks map[string][]byte) []b
 func TestProviderRestore(t *testing.T) {
 	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
 	client := &Client{cfg: &Config{DumpDir: "/var/lib/vz/dump"}, runner: runner}
-	manifest := `{"version":2,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"scsi0":{"size":4}},"pool":"prod"}`
+	manifest := `{"version":1,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"scsi0":{"size":4}},"pool":"prod"}`
 
 	r, err := client.PrepareProviderRestore(context.Background(),
 		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})), nil)
@@ -252,7 +264,7 @@ func TestProviderRestore(t *testing.T) {
 func TestProviderRestoreRejectsUnlistedDisk(t *testing.T) {
 	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
 	client := &Client{cfg: &Config{DumpDir: "/dump"}, runner: runner}
-	manifest := `{"version":2,"vmid":100,"devices":{"scsi0":{"size":4}}}`
+	manifest := `{"version":1,"vmid":100,"devices":{"scsi0":{"size":4}}}`
 
 	_, err := client.PrepareProviderRestore(context.Background(),
 		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi1.raw": []byte("disk")})), nil)
@@ -292,7 +304,7 @@ func TestFleecingStorage(t *testing.T) {
 func TestProviderRestoreCheckRunsBeforeUpload(t *testing.T) {
 	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
 	client := &Client{cfg: &Config{DumpDir: "/dump"}, runner: runner}
-	manifest := `{"version":2,"vmid":100,"devices":{"scsi0":{"size":4}}}`
+	manifest := `{"version":1,"vmid":100,"devices":{"scsi0":{"size":4}}}`
 
 	var checked int
 	_, err := client.PrepareProviderRestore(context.Background(),
@@ -306,5 +318,20 @@ func TestProviderRestoreCheckRunsBeforeUpload(t *testing.T) {
 	}
 	if len(runner.files) != 0 {
 		t.Fatal("nothing must be uploaded when the target is refused")
+	}
+}
+
+func TestProgressWriterEveryFivePercent(t *testing.T) {
+	var disk, lines bytes.Buffer
+	p := &progressWriter{w: &disk, provider: &lines, device: "drive-scsi0", total: 1000}
+	for range 1000 {
+		_, _ = p.Write([]byte{1})
+	}
+	got := strings.Split(strings.TrimSpace(lines.String()), "\n")
+	if len(got) != 20 || disk.Len() != 1000 {
+		t.Fatalf("%d lines for %d bytes: %q", len(got), disk.Len(), got)
+	}
+	if got[0] != `{"progress":{"device":"drive-scsi0","read":50,"total":1000}}` || got[19] != `{"progress":{"device":"drive-scsi0","read":1000,"total":1000}}` {
+		t.Fatalf("lines %q ... %q", got[0], got[19])
 	}
 }

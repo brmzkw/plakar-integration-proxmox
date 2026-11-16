@@ -41,6 +41,7 @@ records waiting on one shared vzdump session could never be read.
    - Holes are not transferred (NBD structured replies).
    - Each read must cover the whole range requested, or the backup fails.
    - What has been read is trimmed when the export allows it, so the fleecing image does not grow.
+   - Every 5% of a disk, a progress line goes to the provider, which logs it in the vzdump task.
 4. Once every disk is in the tar, Plakar replies `ok` (or `error`), and vzdump releases the
    snapshot. The record only ends once vzdump has exited, and a failure fails the record.
 

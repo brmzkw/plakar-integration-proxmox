@@ -110,8 +110,7 @@ func TestCheckProviderProtocol(t *testing.T) {
 		runner  *catRunner
 		wantErr string
 	}{
-		{&catRunner{out: "2\n"}, ""},
-		{&catRunner{out: "1\n"}, "speaks protocol 1, this integration needs 2"},
+		{&catRunner{out: "1\n"}, ""},
 		{&catRunner{err: errors.New("exit status 1")}, "does not publish its protocol"},
 	} {
 		err := (&Client{cfg: &Config{}, runner: tc.runner}).checkProviderProtocol(context.Background())

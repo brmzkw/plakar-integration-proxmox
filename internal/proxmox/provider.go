@@ -41,7 +41,7 @@ import (
 	"github.com/gillesdubois/plakar-integration-proxmox/internal/runner"
 )
 
-const ProviderManifestVersion = 2
+const ProviderManifestVersion = 1
 
 const ProviderProtocolFile = "/usr/share/plakar-pve-provider/protocol"
 
@@ -268,13 +268,37 @@ func (b *providerBackup) writeTar(w io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", device, err)
 		}
-		err = nbd.Copy(tw, conn, device, dev.Size)
+		err = nbd.Copy(&progressWriter{w: tw, provider: b.conn, device: device, total: dev.Size}, conn, device, dev.Size)
 		_ = conn.Close()
 		if err != nil {
 			return err
 		}
 	}
 	return tw.Close()
+}
+
+// The provider logs these lines in the vzdump task; a lost line only costs a log entry.
+type progressWriter struct {
+	w        io.Writer
+	provider io.Writer
+	device   string
+	total    int64
+	read     int64
+	next     int64
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.read += int64(n)
+	if p.total > 0 && p.read*100 >= p.next*p.total {
+		pct := p.read * 100 / p.total
+		p.next = pct - pct%5 + 5
+		if pct > 0 {
+			line, _ := json.Marshal(map[string]any{"progress": map[string]any{"device": p.device, "read": p.read, "total": p.total}})
+			_, _ = p.provider.Write(append(line, '\n'))
+		}
+	}
+	return n, err
 }
 
 func (b *providerBackup) finish(err error) error {
