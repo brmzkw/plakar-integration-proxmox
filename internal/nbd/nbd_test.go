@@ -28,7 +28,7 @@ import (
 )
 
 func TestNBDCopy(t *testing.T) {
-	data := make([]byte, 2*nbdChunkSize+12345)
+	data := make([]byte, (2*nbdBuffers-1)*nbdChunkSize+12345)
 	_, _ = rand.Read(data[:nbdChunkSize/2])
 	_, _ = rand.Read(data[len(data)-100:])
 
@@ -48,7 +48,7 @@ func TestNBDCopy(t *testing.T) {
 		if !bytes.Equal(got.Bytes(), data) {
 			t.Fatalf("structured=%v: data differs", structured)
 		}
-		if srv.Trims.Load() != 3 {
+		if srv.Trims.Load() != 2*nbdBuffers {
 			t.Errorf("structured=%v: %d trims, want one per chunk", structured, srv.Trims.Load())
 		}
 		if structured != (srv.Holes.Load() > 0) {
@@ -68,5 +68,31 @@ func TestNBDCopyRejectsPartialRead(t *testing.T) {
 	err = Copy(io.Discard, conn, "drive-scsi0", int64(len(srv.Data)))
 	if err == nil || !strings.Contains(err.Error(), "covered") {
 		t.Fatalf("a read with a gap must fail, got %v", err)
+	}
+}
+
+type failingWriter struct{ n int }
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	if f.n++; f.n > 1 {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
+
+func TestNBDCopyStopsOnWriteError(t *testing.T) {
+	srv := &nbdtest.Server{Data: make([]byte, 4*nbdBuffers*nbdChunkSize)}
+	conn, err := net.Dial("unix", srv.Listen(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	err = Copy(&failingWriter{}, conn, "drive-scsi0", int64(len(srv.Data)))
+	if err != io.ErrClosedPipe {
+		t.Fatalf("got %v, want the writer's error", err)
+	}
+	if n := srv.Trims.Load(); n > 2+nbdBuffers {
+		t.Errorf("%d pieces read after the writer failed", n)
 	}
 }

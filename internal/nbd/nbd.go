@@ -52,7 +52,8 @@ const (
 	nbdReplyTypeHole      = 2
 	nbdReplyTypeErrFlag   = 1 << 15
 
-	nbdChunkSize = 4 << 20
+	nbdChunkSize = 16 << 20
+	nbdBuffers   = 3
 )
 
 var be = binary.BigEndian
@@ -287,21 +288,52 @@ func Copy(w io.Writer, conn net.Conn, export string, size int64) error {
 		return fmt.Errorf("%s: export is %d bytes, manifest says %d", export, c.size, size)
 	}
 
-	buf := make([]byte, nbdChunkSize)
-	for off := int64(0); off < size; {
-		chunk := buf[:min(int64(nbdChunkSize), size-off)]
-		if err := c.command(nbdCmdRead, uint64(off), uint32(len(chunk)), chunk); err != nil {
-			return fmt.Errorf("%s: %w", export, err)
-		}
-		if _, err := w.Write(chunk); err != nil {
-			return err
-		}
-		if c.flags&nbdTransSendTrim != 0 {
-			if err := c.command(nbdCmdTrim, uint64(off), uint32(len(chunk)), nil); err != nil {
-				return fmt.Errorf("%s: %w", export, err)
-			}
-		}
-		off += int64(len(chunk))
+	// The node is read ahead while Plakar consumes the previous pieces, so neither side waits on the other.
+	free := make(chan []byte, nbdBuffers)
+	full := make(chan []byte, nbdBuffers)
+	for range nbdBuffers {
+		free <- make([]byte, nbdChunkSize)
 	}
-	return nil
+	stop := make(chan struct{})
+	var readErr error
+	go func() {
+		defer close(full)
+		for off := int64(0); off < size; {
+			var buf []byte
+			select {
+			case buf = <-free:
+			case <-stop:
+				return
+			}
+			chunk := buf[:min(int64(nbdChunkSize), size-off)]
+			if err := c.command(nbdCmdRead, uint64(off), uint32(len(chunk)), chunk); err != nil {
+				readErr = fmt.Errorf("%s: %w", export, err)
+				return
+			}
+			if c.flags&nbdTransSendTrim != 0 {
+				if err := c.command(nbdCmdTrim, uint64(off), uint32(len(chunk)), nil); err != nil {
+					readErr = fmt.Errorf("%s: %w", export, err)
+					return
+				}
+			}
+			full <- chunk
+			off += int64(len(chunk))
+		}
+	}()
+
+	var writeErr error
+	for chunk := range full {
+		if writeErr != nil {
+			continue
+		}
+		if _, writeErr = w.Write(chunk); writeErr != nil {
+			close(stop)
+			continue
+		}
+		free <- chunk[:cap(chunk)]
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	return readErr
 }
