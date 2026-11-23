@@ -17,8 +17,15 @@
 package exporter
 
 import (
+	"context"
+	"io"
 	"regexp"
+	"strings"
 	"testing"
+
+	"github.com/PlakarKorp/kloset/connectors"
+	"github.com/PlakarKorp/kloset/objects"
+	"github.com/gillesdubois/plakar-integration-proxmox/internal/proxmox"
 )
 
 func TestIsMissingVMError(t *testing.T) {
@@ -51,6 +58,72 @@ func TestUniqueSMBIOS(t *testing.T) {
 		}
 		if !regexp.MustCompile(pattern).MatchString(got) || regexp.MustCompile("11111111-1111-1111").MatchString(got) {
 			t.Errorf("uniqueSMBIOS(%q) = %q", config, got)
+		}
+	}
+}
+
+func fileRecord(pathname, content string) *connectors.Record {
+	return &connectors.Record{
+		Pathname: pathname,
+		FileInfo: objects.FileInfo{Lmode: 0600, Lsize: int64(len(content))},
+		Reader:   io.NopCloser(strings.NewReader(content)),
+	}
+}
+
+func TestExportRequiresVMID(t *testing.T) {
+	records := make(chan *connectors.Record, 1)
+	results := make(chan *connectors.Result, 1)
+	records <- fileRecord("/backup/qemu/100_a/qemu-2026_11_18-14_00_00/manifest.json", "{}")
+	close(records)
+
+	err := (&ProxmoxExporter{temp: proxmox.NewTempFiles(nil)}).Export(context.Background(), records, results)
+	if err == nil || !strings.Contains(err.Error(), "vmid") {
+		t.Fatalf("got %v", err)
+	}
+	if res := <-results; res.Err == nil {
+		t.Fatal("the record must fail too")
+	}
+}
+
+func TestProviderRunSkipsOtherVMs(t *testing.T) {
+	results := make(chan *connectors.Result, 10)
+	run := &providerRun{p: &ProxmoxExporter{restoreOpts: restoreOptions{vmid: 200}}, ctx: context.Background(), results: results}
+	dir := "/backup/qemu/100_a/qemu-2026_11_18-14_00_00/"
+
+	run.handle(fileRecord(dir+"manifest.json", `{"version":1,"vmid":100,"devices":{"drive-scsi0":{"size":4}}}`))
+	run.handle(fileRecord(dir+"vm-drive-scsi0.raw", "disk"))
+	run.end()
+	close(results)
+
+	n := 0
+	for res := range results {
+		n++
+		if res.Err != nil {
+			t.Errorf("%s: %v", res.Record.Pathname, res.Err)
+		}
+	}
+	if n != 2 || run.found {
+		t.Fatalf("%d results, found %v", n, run.found)
+	}
+}
+
+func TestProviderRunDiskBeforeManifest(t *testing.T) {
+	results := make(chan *connectors.Result, 1)
+	run := &providerRun{p: &ProxmoxExporter{restoreOpts: restoreOptions{vmid: 100}}, ctx: context.Background(), results: results}
+
+	run.handle(fileRecord("/backup/qemu/100_a/qemu-2026_11_18-14_00_00/vm-drive-scsi0.raw", "disk"))
+	if res := <-results; res.Err == nil || !strings.Contains(res.Err.Error(), "comes before") {
+		t.Fatalf("got %v", res.Err)
+	}
+}
+
+func TestParseRestoreVMID(t *testing.T) {
+	if opts, err := parseRestoreOptions(map[string]string{"vmid": "101"}); err != nil || opts.vmid != 101 {
+		t.Fatalf("got %+v, %v", opts, err)
+	}
+	for _, bad := range []string{"0", "-1", "abc"} {
+		if _, err := parseRestoreOptions(map[string]string{"vmid": bad}); err == nil {
+			t.Errorf("vmid=%s must be refused", bad)
 		}
 	}
 }

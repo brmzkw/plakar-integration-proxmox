@@ -61,6 +61,7 @@ type vmRuntimeState struct {
 }
 
 type restoreOptions struct {
+	vmid           int
 	startOnRestore bool
 	forceVMRestore bool
 	unique         bool
@@ -105,7 +106,7 @@ func NewProxmoxExporter(ctx context.Context, opts *connectors.Options, name stri
 func (p *ProxmoxExporter) Origin() string        { return p.cfg.Origin() }
 func (p *ProxmoxExporter) Type() string          { return protocolName }
 func (p *ProxmoxExporter) Root() string          { return "/" }
-func (p *ProxmoxExporter) Flags() location.Flags { return 0 }
+func (p *ProxmoxExporter) Flags() location.Flags { return location.FLAG_WALKDIRORDER }
 
 func (p *ProxmoxExporter) Ping(ctx context.Context) error {
 	if err := p.client.Ping(ctx); err != nil {
@@ -126,10 +127,18 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 
 	defer p.temp.Sweep(ctx)
 
+	if p.restoreOpts.vmid == 0 {
+		err := fmt.Errorf("missing vmid: pass -o vmid=<id> to choose the VM/CT to restore")
+		drainRecords(records, results, err)
+		return err
+	}
 	if err := p.preflight(ctx); err != nil {
 		drainRecords(records, results, err)
 		return err
 	}
+
+	run := &providerRun{p: p, ctx: ctx, results: results}
+	found := false
 
 	sidecars := make(map[string]vmConfigSidecar)
 	poolSidecars := make(map[string]string)
@@ -146,11 +155,12 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
-		base := path.Base(record.Pathname)
-		if proxmox.ProviderArchiveRegex.MatchString(base) {
-			results <- resultFromRecord(record, p.restoreProvider(ctx, record))
+		if proxmox.ProviderBackupDirRegex.MatchString(path.Base(path.Dir(record.Pathname))) {
+			run.handle(record)
 			continue
 		}
+
+		base := path.Base(record.Pathname)
 
 		if dumpBase, kind, ok := proxmox.ParseSidecarFilename(base); ok {
 			err := collectSidecar(record, dumpBase, kind, sidecars, poolSidecars)
@@ -170,6 +180,12 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			results <- record.Ok()
 			continue
 		}
+		if vmid != p.restoreOpts.vmid {
+			_ = closeRecord(record)
+			results <- record.Ok()
+			continue
+		}
+		found = true
 
 		if err := p.checkTarget(ctx, vmType, p.targetVMID(vmid)); err != nil {
 			results <- record.Error(err)
@@ -202,6 +218,7 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			dumpPath: dumpPath,
 		})
 	}
+	run.end()
 
 	for _, pending := range pendingRestores {
 		if err := ctx.Err(); err != nil {
@@ -234,30 +251,131 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 		results <- resultFromRecord(pending.record, err)
 	}
 
+	if !found && !run.found {
+		return fmt.Errorf("no backup of VM/CT %d in this snapshot", p.restoreOpts.vmid)
+	}
 	return nil
 }
 
-func (p *ProxmoxExporter) restoreProvider(ctx context.Context, record *connectors.Record) error {
-	if record.Reader == nil {
-		return fmt.Errorf("missing record reader for %s", record.Pathname)
+type providerRun struct {
+	p       *ProxmoxExporter
+	ctx     context.Context
+	results chan<- *connectors.Result
+	found   bool
+	current *providerSession
+}
+
+type providerSession struct {
+	dir      string
+	manifest *connectors.Record
+	restore  *proxmox.ProviderRestore
+	err      error
+}
+
+func (r *providerRun) handle(record *connectors.Record) {
+	dir, base := path.Split(record.Pathname)
+	if r.current != nil && r.current.dir != dir {
+		r.end()
 	}
-	if err := p.client.CheckProvider(ctx); err != nil {
+
+	if base == proxmox.ProviderManifestFile {
+		r.start(dir, record)
+		return
+	}
+
+	device, ok := proxmox.ParseProviderDiskFile(base)
+	if !ok || (r.current != nil && r.current.manifest == nil) {
 		_ = closeRecord(record)
-		return err
+		r.results <- record.Ok()
+		return
 	}
-	session, err := p.client.PrepareProviderRestore(ctx, record.Reader, func(m proxmox.ProviderManifest) error {
-		return p.checkTarget(ctx, "qemu", p.targetVMID(m.VMID))
-	})
-	if closeErr := closeRecord(record); err == nil && closeErr != nil {
-		session.Close()
-		return closeErr
+	if r.current == nil {
+		_ = closeRecord(record)
+		r.results <- record.Error(fmt.Errorf("%s comes before its %s", record.Pathname, proxmox.ProviderManifestFile))
+		return
+	}
+
+	s := r.current
+	if s.restore == nil {
+		_ = closeRecord(record)
+		r.results <- record.Ok()
+		return
+	}
+	err := s.restore.AddDisk(r.ctx, device, record.FileInfo.Lsize, record.Reader)
+	if closeErr := closeRecord(record); err == nil {
+		err = closeErr
 	}
 	if err != nil {
-		return err
+		s.fail(err)
 	}
-	defer session.Close()
+	r.results <- resultFromRecord(record, err)
+	if s.restore != nil && s.restore.Complete() {
+		r.end()
+	}
+}
 
-	return p.restoreDump(ctx, session.Volume, "qemu", p.targetVMID(session.Manifest.VMID), []byte(session.Manifest.GuestConfig), session.Manifest.Pool)
+func (r *providerRun) start(dir string, record *connectors.Record) {
+	s := &providerSession{dir: dir}
+	r.current = s
+
+	var m proxmox.ProviderManifest
+	var err error
+	if record.FileInfo.Lsize > proxmox.MaxProviderManifest {
+		_ = closeRecord(record)
+		err = fmt.Errorf("%s is too large", record.Pathname)
+	} else {
+		var data []byte
+		if data, err = readRecordBytes(record); err == nil {
+			m, err = proxmox.ParseProviderManifest(data)
+		}
+	}
+	if err == nil && m.VMID != r.p.restoreOpts.vmid {
+		r.results <- record.Ok()
+		return
+	}
+
+	r.found = true
+	s.manifest = record
+	if err == nil {
+		err = r.p.client.CheckProvider(r.ctx)
+	}
+	if err == nil {
+		err = r.p.checkTarget(r.ctx, "qemu", r.p.targetVMID(m.VMID))
+	}
+	if err == nil {
+		s.restore, err = r.p.client.PrepareProviderRestore(r.ctx, m)
+	}
+	s.err = err
+}
+
+func (s *providerSession) fail(err error) {
+	if s.err == nil {
+		s.err = err
+	}
+	if s.restore != nil {
+		s.restore.Close()
+		s.restore = nil
+	}
+}
+
+func (r *providerRun) end() {
+	s := r.current
+	if s == nil {
+		return
+	}
+	r.current = nil
+
+	if s.restore != nil {
+		err := s.restore.Finish(r.ctx)
+		if err == nil {
+			m := s.restore.Manifest
+			err = r.p.restoreDump(r.ctx, s.restore.Volume, "qemu", r.p.targetVMID(m.VMID), []byte(m.GuestConfig), m.Pool)
+		}
+		s.fail(err)
+	}
+	if s.manifest != nil {
+		r.results <- resultFromRecord(s.manifest, s.err)
+	}
 }
 
 func (p *ProxmoxExporter) Close(ctx context.Context) error {
@@ -655,6 +773,14 @@ func parseRestoreOptions(config map[string]string) (restoreOptions, error) {
 		}
 		opts.unique = unique
 		opts.uniqueSet = true
+	}
+
+	if vmidRaw := strings.TrimSpace(config["vmid"]); vmidRaw != "" {
+		vmid, err := strconv.Atoi(vmidRaw)
+		if err != nil || vmid <= 0 {
+			return restoreOptions{}, fmt.Errorf("vmid must be a positive integer: %s", vmidRaw)
+		}
+		opts.vmid = vmid
 	}
 
 	opts.storage = strings.TrimSpace(config["storage"])

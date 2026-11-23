@@ -17,26 +17,26 @@
 package proxmox
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/PlakarKorp/kloset/connectors"
 	"github.com/gillesdubois/plakar-integration-proxmox/internal/nbd"
 	"github.com/gillesdubois/plakar-integration-proxmox/internal/runner"
 )
@@ -49,17 +49,31 @@ const (
 	ProviderManifestFile = "manifest.json"
 	ProviderGuestFile    = "guest.conf"
 	ProviderFirewallFile = "firewall.conf"
+	ProviderDiskPrefix   = "vm-"
 	ProviderDiskSuffix   = ".raw"
 
-	maxProviderManifest = 4 << 20
+	MaxProviderManifest = 4 << 20
 )
 
 var providerDeviceRegex = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9_.-]*$`)
 
-var ProviderArchiveRegex = regexp.MustCompile(`^qemu-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}\.tar$`)
+var ProviderBackupDirRegex = regexp.MustCompile(`^qemu-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$`)
 
-func ProviderArchiveName(t time.Time) string {
-	return "qemu-" + t.Format(DumpTimeFormat) + ".tar"
+func ProviderBackupDirName(t time.Time) string {
+	return "qemu-" + t.Format(DumpTimeFormat)
+}
+
+func ProviderDiskFile(device string) string {
+	return ProviderDiskPrefix + device + ProviderDiskSuffix
+}
+
+func ParseProviderDiskFile(name string) (string, bool) {
+	device, ok := strings.CutPrefix(name, ProviderDiskPrefix)
+	if !ok {
+		return "", false
+	}
+	device, ok = strings.CutSuffix(device, ProviderDiskSuffix)
+	return device, ok && providerDeviceRegex.MatchString(device)
 }
 
 type ProviderDevice struct {
@@ -115,33 +129,160 @@ func (m *ProviderManifest) Stored() ([]byte, error) {
 	return json.MarshalIndent(&stored, "", "  ")
 }
 
-func (c *Client) ProviderBackupStream(ctx context.Context, vmid int, pool string) io.ReadCloser {
-	return connectors.NewLazyReader(func() (io.ReadCloser, error) {
-		b, err := c.startProviderBackup(ctx, vmid)
+type ProviderRecord struct {
+	File   string
+	Reader io.ReadCloser
+}
+
+func (c *Client) ProviderBackup(ctx context.Context, vmid int, pool string, devices []string) []ProviderRecord {
+	v := &providerVM{c: c, ctx: ctx, vmid: vmid, pool: pool, devices: devices, pending: len(devices)}
+	records := []ProviderRecord{{File: ProviderManifestFile, Reader: &manifestReader{v: v}}}
+	for _, device := range devices {
+		records = append(records, ProviderRecord{File: ProviderDiskFile(device), Reader: &diskReader{v: v, device: device}})
+	}
+	return records
+}
+
+type providerVM struct {
+	c       *Client
+	ctx     context.Context
+	vmid    int
+	pool    string
+	devices []string
+
+	once     sync.Once
+	manifest []byte
+	startErr error
+
+	mu      sync.Mutex
+	b       *providerBackup
+	pending int
+	err     error
+}
+
+func (v *providerVM) start() error {
+	v.once.Do(func() {
+		b, err := v.c.startProviderBackup(v.ctx, v.vmid)
 		if err != nil {
-			return nil, err
+			v.startErr = err
+			return
 		}
-		b.Manifest.Pool = pool
-
-		pr, pw := io.Pipe()
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			_ = pw.CloseWithError(b.finish(b.writeTar(pw)))
-		}()
-		return &providerStream{PipeReader: pr, done: done}, nil
+		b.Manifest.Pool = v.pool
+		if got := b.Manifest.DeviceNames(); !slices.Equal(got, v.devices) {
+			err = fmt.Errorf("vzdump backs up disks %v but the VM config lists %v", got, v.devices)
+		}
+		if err == nil {
+			v.manifest, err = b.Manifest.Stored()
+		}
+		if err != nil {
+			v.startErr = b.finish(err)
+			return
+		}
+		v.mu.Lock()
+		v.b = b
+		allClosed := v.pending == 0
+		v.mu.Unlock()
+		if allClosed {
+			v.startErr = b.finish(errors.New("every disk record was closed unread"))
+		}
 	})
+	return v.startErr
 }
 
-type providerStream struct {
-	*io.PipeReader
-	done chan struct{}
+func (v *providerVM) release(err error) error {
+	v.mu.Lock()
+	if err != nil && v.err == nil {
+		v.err = err
+	}
+	v.pending--
+	b, last, sessionErr := v.b, v.pending == 0, v.err
+	v.mu.Unlock()
+
+	if !last || b == nil {
+		return err
+	}
+	return b.finish(sessionErr)
 }
 
-func (s *providerStream) Close() error {
-	_ = s.PipeReader.Close()
-	<-s.done
+type manifestReader struct {
+	v  *providerVM
+	rd *bytes.Reader
+}
+
+func (m *manifestReader) Read(p []byte) (int, error) {
+	if m.rd == nil {
+		if err := m.v.start(); err != nil {
+			return 0, err
+		}
+		m.rd = bytes.NewReader(m.v.manifest)
+	}
+	return m.rd.Read(p)
+}
+
+func (m *manifestReader) Close() error { return nil }
+
+type diskReader struct {
+	v      *providerVM
+	device string
+
+	open, close sync.Once
+	opened      bool
+	pr          *io.PipeReader
+	done        chan struct{}
+}
+
+func (d *diskReader) start() {
+	d.opened = true
+	pr, pw := io.Pipe()
+	d.pr, d.done = pr, make(chan struct{})
+	go func() {
+		defer close(d.done)
+		err := d.v.start()
+		if err == nil {
+			err = d.copy(pw)
+		}
+		_ = pw.CloseWithError(d.v.release(err))
+	}()
+}
+
+func (d *diskReader) copy(w io.Writer) error {
+	b := d.v.b
+	dev := b.Manifest.Devices[d.device]
+	conn, err := b.c.runner.DialUnix(dev.NBDPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", d.device, err)
+	}
+	defer func() { _ = conn.Close() }()
+	return nbd.Copy(&progressWriter{w: w, provider: b.progress, device: d.device, total: dev.Size}, conn, d.device, dev.Size)
+}
+
+func (d *diskReader) Read(p []byte) (int, error) {
+	d.open.Do(d.start)
+	return d.pr.Read(p)
+}
+
+func (d *diskReader) Close() error {
+	d.close.Do(func() {
+		d.open.Do(func() {})
+		if !d.opened {
+			_ = d.v.release(fmt.Errorf("%s: disk was never read", d.device))
+			return
+		}
+		_ = d.pr.Close()
+		<-d.done
+	})
 	return nil
+}
+
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 type providerBackup struct {
@@ -151,6 +292,7 @@ type providerBackup struct {
 	sockPath string
 	ln       net.Listener
 	conn     net.Conn
+	progress io.Writer
 
 	vzdumpDone chan struct{}
 	vzdumpErr  error
@@ -211,8 +353,9 @@ func (c *Client) startProviderBackup(ctx context.Context, vmid int) (*providerBa
 		return nil, fmt.Errorf("provider never connected: %w", err)
 	}
 	b.conn = conn
+	b.progress = &lockedWriter{w: conn}
 
-	line, err := bufio.NewReader(io.LimitReader(conn, maxProviderManifest)).ReadBytes('\n')
+	line, err := bufio.NewReader(io.LimitReader(conn, MaxProviderManifest)).ReadBytes('\n')
 	if err == nil {
 		err = json.Unmarshal(line, &b.Manifest)
 	}
@@ -238,43 +381,6 @@ func (b *providerBackup) waitVzdump(stream *runner.CommandStream) {
 	}
 	_ = b.ln.Close()
 	close(b.vzdumpDone)
-}
-
-func (b *providerBackup) writeTar(w io.Writer) error {
-	manifest, err := b.Manifest.Stored()
-	if err != nil {
-		return err
-	}
-
-	tw := tar.NewWriter(w)
-	now := time.Now()
-	header := func(name string, size int64) error {
-		return tw.WriteHeader(&tar.Header{Name: name, Size: size, Mode: 0600, ModTime: now, Typeflag: tar.TypeReg})
-	}
-
-	if err := header(ProviderManifestFile, int64(len(manifest))); err != nil {
-		return err
-	}
-	if _, err := tw.Write(manifest); err != nil {
-		return err
-	}
-
-	for _, device := range b.Manifest.DeviceNames() {
-		dev := b.Manifest.Devices[device]
-		if err := header(device+ProviderDiskSuffix, dev.Size); err != nil {
-			return err
-		}
-		conn, err := b.c.runner.DialUnix(dev.NBDPath)
-		if err != nil {
-			return fmt.Errorf("%s: %w", device, err)
-		}
-		err = nbd.Copy(&progressWriter{w: tw, provider: b.conn, device: device, total: dev.Size}, conn, device, dev.Size)
-		_ = conn.Close()
-		if err != nil {
-			return err
-		}
-	}
-	return tw.Close()
 }
 
 // The provider logs these lines in the vzdump task; a lost line only costs a log entry.
@@ -323,6 +429,14 @@ func (b *providerBackup) finish(err error) error {
 	return b.vzdumpErr
 }
 
+func ParseProviderManifest(data []byte) (ProviderManifest, error) {
+	var m ProviderManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return m, fmt.Errorf("invalid %s: %w", ProviderManifestFile, err)
+	}
+	return m, m.Validate()
+}
+
 type ProviderRestore struct {
 	Volume   string
 	Manifest ProviderManifest
@@ -330,76 +444,54 @@ type ProviderRestore struct {
 	c      *Client
 	dir    string
 	images []string
+	served map[string]bool
 }
 
-func (c *Client) PrepareProviderRestore(ctx context.Context, archive io.Reader, check func(ProviderManifest) error) (*ProviderRestore, error) {
-	r := &ProviderRestore{c: c}
-	if err := r.prepare(ctx, archive, check); err != nil {
-		r.Close()
-		return nil, err
+func (c *Client) PrepareProviderRestore(ctx context.Context, m ProviderManifest) (*ProviderRestore, error) {
+	stamp := time.Now().Unix()
+	r := &ProviderRestore{
+		c:        c,
+		Manifest: m,
+		Volume:   fmt.Sprintf("%s:%d/qemu-%d", ProviderStorage, m.VMID, stamp),
+		dir:      path.Join(ProviderSessionRoot, ProviderStorage, "restore", fmt.Sprintf("%d-qemu-%d", m.VMID, stamp)),
+		served:   make(map[string]bool),
+	}
+	if _, stderr, err := c.runner.Run(ctx, "mkdir", "-p", "-m", "0700", "--", r.dir); err != nil {
+		return nil, fmt.Errorf("unable to create restore session %s: %w: %s", r.dir, err, strings.TrimSpace(stderr))
 	}
 	return r, nil
 }
 
-func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader, check func(ProviderManifest) error) error {
-	tr := tar.NewReader(archive)
+func (r *ProviderRestore) Complete() bool {
+	return len(r.served) == len(r.Manifest.Devices)
+}
 
-	hdr, err := tr.Next()
-	if err != nil {
-		return fmt.Errorf("invalid provider archive: %w", err)
+func (r *ProviderRestore) AddDisk(ctx context.Context, device string, size int64, data io.Reader) error {
+	if dev, listed := r.Manifest.Devices[device]; !listed || r.served[device] || dev.Size != size {
+		return fmt.Errorf("unexpected disk %s for VM %d (not in its manifest, repeated or wrong size)", device, r.Manifest.VMID)
 	}
-	if hdr.Name != ProviderManifestFile || hdr.Size > maxProviderManifest {
-		return fmt.Errorf("invalid provider archive: %s must come first", ProviderManifestFile)
-	}
-	data, err := io.ReadAll(tr)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(data, &r.Manifest); err != nil {
-		return fmt.Errorf("invalid %s: %w", ProviderManifestFile, err)
-	}
-	if err := r.Manifest.Validate(); err != nil {
-		return err
-	}
-	if check != nil {
-		if err := check(r.Manifest); err != nil {
-			return err
-		}
+	image := path.Join(r.c.cfg.DumpDir, fmt.Sprintf("plakar-%d-%s%s", time.Now().UnixNano(), device, ProviderDiskSuffix))
+	r.images = append(r.images, image)
+	if err := r.writeFile(ctx, image, data); err != nil {
+		return fmt.Errorf("unable to upload %s to %s: %w", device, image, err)
 	}
 
-	stamp := time.Now().Unix()
-	r.Volume = fmt.Sprintf("%s:%d/qemu-%d", ProviderStorage, r.Manifest.VMID, stamp)
-	r.dir = path.Join(ProviderSessionRoot, ProviderStorage, "restore", fmt.Sprintf("%d-qemu-%d", r.Manifest.VMID, stamp))
-	if _, stderr, err := r.c.runner.Run(ctx, "mkdir", "-p", "-m", "0700", "--", r.dir); err != nil {
-		return fmt.Errorf("unable to create restore session %s: %w: %s", r.dir, err, strings.TrimSpace(stderr))
-	}
+	dev := r.Manifest.Devices[device]
+	dev.Image = image
+	r.Manifest.Devices[device] = dev
+	r.served[device] = true
+	return nil
+}
 
-	served := make(map[string]bool)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("invalid provider archive: %w", err)
-		}
-		device, ok := strings.CutSuffix(hdr.Name, ProviderDiskSuffix)
-		if dev, listed := r.Manifest.Devices[device]; !ok || !listed || served[device] || dev.Size != hdr.Size {
-			return fmt.Errorf("invalid provider archive: unexpected entry %s", hdr.Name)
-		}
-		if err := r.uploadDisk(ctx, device, tr); err != nil {
-			return err
-		}
-		served[device] = true
+func (r *ProviderRestore) Finish(ctx context.Context) error {
+	if !r.Complete() {
+		return fmt.Errorf("incomplete backup of VM %d: %d of %d disks", r.Manifest.VMID, len(r.served), len(r.Manifest.Devices))
 	}
-	if len(served) != len(r.Manifest.Devices) {
-		return fmt.Errorf("invalid provider archive: %d of %d disks", len(served), len(r.Manifest.Devices))
-	}
-
 	files := map[string][]byte{ProviderGuestFile: []byte(r.Manifest.GuestConfig)}
 	if r.Manifest.FirewallConfig != nil {
 		files[ProviderFirewallFile] = []byte(*r.Manifest.FirewallConfig)
 	}
+	var err error
 	files[ProviderManifestFile], err = r.Manifest.Stored()
 	if err != nil {
 		return err
@@ -411,19 +503,6 @@ func (r *ProviderRestore) prepare(ctx context.Context, archive io.Reader, check 
 			}
 		}
 	}
-	return nil
-}
-
-func (r *ProviderRestore) uploadDisk(ctx context.Context, device string, data io.Reader) error {
-	image := path.Join(r.c.cfg.DumpDir, fmt.Sprintf("plakar-%d-%s%s", time.Now().UnixNano(), device, ProviderDiskSuffix))
-	r.images = append(r.images, image)
-	if err := r.writeFile(ctx, image, data); err != nil {
-		return fmt.Errorf("unable to upload %s to %s: %w", device, image, err)
-	}
-
-	dev := r.Manifest.Devices[device]
-	dev.Image = image
-	r.Manifest.Devices[device] = dev
 	return nil
 }
 

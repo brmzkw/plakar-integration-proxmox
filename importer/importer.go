@@ -209,19 +209,26 @@ func (p *ProxmoxImporter) importVMProvider(ctx context.Context, records chan<- *
 	if err != nil {
 		return err
 	}
+	config, err := p.client.ReadQEMUConfig(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	devices := proxmox.ProviderDevices(config)
+	if len(devices) == 0 {
+		return fmt.Errorf("qemu %d has no disk to back up", vmid)
+	}
 
-	name := proxmox.ProviderArchiveName(time.Now())
-	return p.emitRecord(ctx, records, &connectors.Record{
-		Pathname: buildBackupSnapshotPath("qemu", vmid, vmName, name),
-		FileInfo: objects.FileInfo{
-			Lname:    name,
-			Lsize:    -1,
-			Lmode:    0600,
-			LmodTime: time.Now(),
-			Ldev:     1,
-		},
-		Reader: p.client.ProviderBackupStream(ctx, vmid, pool),
-	})
+	dir := buildBackupSnapshotPath("qemu", vmid, vmName, proxmox.ProviderBackupDirName(time.Now()))
+	recs := p.client.ProviderBackup(ctx, vmid, pool, devices)
+	for i, rec := range recs {
+		if err := p.emitRecord(ctx, records, newRecord(path.Join(dir, rec.File), -1, rec.Reader)); err != nil {
+			for _, rest := range recs[i+1:] {
+				_ = rest.Reader.Close()
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
@@ -252,17 +259,21 @@ func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int, vmNam
 }
 
 func (p *ProxmoxImporter) emitSidecar(ctx context.Context, records chan<- *connectors.Record, vmid int, vmName, name string, data []byte) error {
-	return p.emitRecord(ctx, records, &connectors.Record{
-		Pathname: buildBackupSnapshotPath("lxc", vmid, vmName, name),
+	return p.emitRecord(ctx, records, newRecord(buildBackupSnapshotPath("lxc", vmid, vmName, name), int64(len(data)), io.NopCloser(bytes.NewReader(data))))
+}
+
+func newRecord(pathname string, size int64, reader io.ReadCloser) *connectors.Record {
+	return &connectors.Record{
+		Pathname: pathname,
 		FileInfo: objects.FileInfo{
-			Lname:    name,
-			Lsize:    int64(len(data)),
+			Lname:    path.Base(pathname),
+			Lsize:    size,
 			Lmode:    0600,
 			LmodTime: time.Now(),
 			Ldev:     1,
 		},
-		Reader: io.NopCloser(bytes.NewReader(data)),
-	})
+		Reader: reader,
+	}
 }
 
 func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connectors.Record, record *connectors.Record) error {

@@ -17,7 +17,6 @@
 package proxmox
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -92,34 +91,33 @@ func newBackupFixture(t *testing.T, data []byte) (*Client, *fakeProviderRunner) 
 	return &Client{cfg: &Config{BackupMode: "snapshot"}, runner: runner}, runner
 }
 
-func TestProviderBackupStream(t *testing.T) {
-	data := bytes.Repeat([]byte("plakar\x00\x00"), 300000)
-	client, runner := newBackupFixture(t, data)
-
-	stream := client.ProviderBackupStream(context.Background(), 100, "prod")
-	archive, err := io.ReadAll(stream)
+func readAll(t *testing.T, r io.ReadCloser) []byte {
+	t.Helper()
+	data, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = stream.Close()
+	_ = r.Close()
+	return data
+}
 
-	tr := tar.NewReader(bytes.NewReader(archive))
-	hdr, err := tr.Next()
-	if err != nil || hdr.Name != ProviderManifestFile {
-		t.Fatalf("first entry %v, %v", hdr, err)
+func TestProviderBackup(t *testing.T) {
+	data := bytes.Repeat([]byte("plakar\x00\x00"), 300000)
+	client, runner := newBackupFixture(t, data)
+
+	recs := client.ProviderBackup(context.Background(), 100, "prod", []string{"drive-scsi0"})
+	if len(recs) != 2 || recs[0].File != ProviderManifestFile || recs[1].File != "vm-drive-scsi0.raw" {
+		t.Fatalf("records %+v", recs)
 	}
+
 	var m ProviderManifest
-	if err := json.NewDecoder(tr).Decode(&m); err != nil || m.Pool != "prod" || m.GuestConfig != "cores: 1\n" {
+	if err := json.Unmarshal(readAll(t, recs[0].Reader), &m); err != nil || m.Pool != "prod" || m.GuestConfig != "cores: 1\n" {
 		t.Fatalf("manifest %+v, %v", m, err)
 	}
 	if m.Devices["drive-scsi0"].NBDPath != "" {
 		t.Error("node socket path must not be stored")
 	}
-	hdr, err = tr.Next()
-	if err != nil || hdr.Name != "drive-scsi0.raw" {
-		t.Fatalf("second entry %v, %v", hdr, err)
-	}
-	if disk, _ := io.ReadAll(tr); !bytes.Equal(disk, data) {
+	if disk := readAll(t, recs[1].Reader); !bytes.Equal(disk, data) {
 		t.Fatal("disk content differs")
 	}
 
@@ -137,20 +135,82 @@ func TestProviderBackupStream(t *testing.T) {
 	}
 }
 
-func TestProviderBackupStreamClosedEarly(t *testing.T) {
+func TestProviderBackupDiskReadFirst(t *testing.T) {
+	data := []byte("disk")
+	client, runner := newBackupFixture(t, data)
+
+	recs := client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi0"})
+	if disk := readAll(t, recs[1].Reader); !bytes.Equal(disk, data) {
+		t.Fatal("disk content differs")
+	}
+	if !strings.Contains(<-runner.reply, `"ok"`) {
+		t.Fatal("backup must succeed")
+	}
+	if len(readAll(t, recs[0].Reader)) == 0 {
+		t.Fatal("manifest must still be readable after the session ended")
+	}
+}
+
+func TestProviderBackupNothingRunsUnread(t *testing.T) {
+	client, runner := newBackupFixture(t, []byte("disk"))
+
+	for _, rec := range client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi0"}) {
+		_ = rec.Reader.Close()
+	}
+	select {
+	case reply := <-runner.reply:
+		t.Fatalf("vzdump must not run, provider got %q", reply)
+	default:
+	}
+	if !client.vzdumpMu.TryLock() {
+		t.Fatal("vzdump lock taken")
+	}
+}
+
+func TestProviderBackupDisksClosedBeforeManifest(t *testing.T) {
+	client, runner := newBackupFixture(t, []byte("disk"))
+
+	recs := client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi0"})
+	_ = recs[1].Reader.Close()
+	if _, err := io.ReadAll(recs[0].Reader); err == nil {
+		t.Fatal("a session with no disk read must fail")
+	}
+	if !strings.Contains(<-runner.reply, `"error"`) || !client.vzdumpMu.TryLock() {
+		t.Fatal("the session must be ended with an error")
+	}
+}
+
+func TestProviderBackupClosedEarly(t *testing.T) {
 	client, runner := newBackupFixture(t, bytes.Repeat([]byte{1}, 3*4<<20))
 
-	stream := client.ProviderBackupStream(context.Background(), 100, "")
-	if _, err := stream.Read(make([]byte, 10)); err != nil {
+	recs := client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi0"})
+	if _, err := recs[1].Reader.Read(make([]byte, 10)); err != nil {
 		t.Fatal(err)
 	}
-	_ = stream.Close()
+	_ = recs[1].Reader.Close()
 
 	if reply := <-runner.reply; !strings.Contains(reply, `"error"`) {
 		t.Fatalf("an unfinished backup must be reported to the provider, got %q", reply)
 	}
 	if !client.vzdumpMu.TryLock() {
 		t.Fatal("vzdump lock still held")
+	}
+}
+
+func TestProviderBackupDeviceMismatch(t *testing.T) {
+	client, runner := newBackupFixture(t, []byte("disk"))
+
+	recs := client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi1"})
+	_, err := io.ReadAll(recs[0].Reader)
+	if err == nil || !strings.Contains(err.Error(), "VM config lists") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := io.ReadAll(recs[1].Reader); err == nil {
+		t.Fatal("disk read must fail too")
+	}
+	_ = recs[1].Reader.Close()
+	if !strings.Contains(<-runner.reply, `"error"`) || !client.vzdumpMu.TryLock() {
+		t.Fatal("the session must be ended with an error")
 	}
 }
 
@@ -164,10 +224,12 @@ func (r *failingVzdumpRunner) Stream(context.Context, string, ...string) (*runne
 func TestProviderBackupReportsVzdumpFailure(t *testing.T) {
 	client := &Client{cfg: &Config{BackupMode: "snapshot"}, runner: &failingVzdumpRunner{fakeProviderRunner{root: t.TempDir()}}}
 
-	_, err := io.ReadAll(client.ProviderBackupStream(context.Background(), 100, ""))
+	recs := client.ProviderBackup(context.Background(), 100, "", []string{"drive-scsi0"})
+	_, err := io.ReadAll(recs[0].Reader)
 	if err == nil || !strings.Contains(err.Error(), "VM 100 is locked") {
 		t.Fatalf("expected vzdump's stderr in the error, got %v", err)
 	}
+	_ = recs[1].Reader.Close()
 	if !client.vzdumpMu.TryLock() {
 		t.Fatal("vzdump lock still held")
 	}
@@ -201,31 +263,22 @@ func (r *recordingRunner) Remove(_ context.Context, path string) error {
 	return nil
 }
 
-func providerArchive(t *testing.T, manifest string, disks map[string][]byte) []byte {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	add := func(name string, data []byte) {
-		if err := tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(data)), Mode: 0600}); err != nil {
-			t.Fatal(err)
-		}
-		_, _ = tw.Write(data)
-	}
-	add(ProviderManifestFile, []byte(manifest))
-	for name, data := range disks {
-		add(name, data)
-	}
-	_ = tw.Close()
-	return buf.Bytes()
-}
-
 func TestProviderRestore(t *testing.T) {
 	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
 	client := &Client{cfg: &Config{DumpDir: "/var/lib/vz/dump"}, runner: runner}
-	manifest := `{"version":1,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"scsi0":{"size":4}},"pool":"prod"}`
-
-	r, err := client.PrepareProviderRestore(context.Background(),
-		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})), nil)
+	m, err := ParseProviderManifest([]byte(`{"version":1,"vmid":100,"archive":"100/qemu-1","guest-config":"cores: 1\n","firewall-config":null,"devices":{"scsi0":{"size":4}},"pool":"prod"}`))
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := client.PrepareProviderRestore(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddDisk(context.Background(), "scsi0", 4, strings.NewReader("disk")); err != nil || !r.Complete() {
+		t.Fatalf("AddDisk: %v, complete %v", err, r.Complete())
+	}
+	if err := r.Finish(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -261,18 +314,43 @@ func TestProviderRestore(t *testing.T) {
 	}
 }
 
-func TestProviderRestoreRejectsUnlistedDisk(t *testing.T) {
+func TestProviderRestoreRejectsBadDisks(t *testing.T) {
 	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
 	client := &Client{cfg: &Config{DumpDir: "/dump"}, runner: runner}
-	manifest := `{"version":1,"vmid":100,"devices":{"scsi0":{"size":4}}}`
+	m, _ := ParseProviderManifest([]byte(`{"version":1,"vmid":100,"devices":{"scsi0":{"size":4}}}`))
 
-	_, err := client.PrepareProviderRestore(context.Background(),
-		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi1.raw": []byte("disk")})), nil)
-	if err == nil || !strings.Contains(err.Error(), "unexpected entry") {
-		t.Fatalf("got %v", err)
+	r, err := client.PrepareProviderRestore(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddDisk(context.Background(), "scsi1", 4, strings.NewReader("disk")); err == nil {
+		t.Fatal("an unlisted disk must be refused")
+	}
+	if err := r.AddDisk(context.Background(), "scsi0", 5, strings.NewReader("disk!")); err == nil {
+		t.Fatal("a disk of the wrong size must be refused")
 	}
 	if len(runner.files) != 0 {
-		t.Fatal("nothing must be uploaded for an unlisted disk")
+		t.Fatal("nothing must be uploaded for a refused disk")
+	}
+	if err := r.Finish(context.Background()); err == nil || !strings.Contains(err.Error(), "0 of 1 disks") {
+		t.Fatalf("an incomplete restore must fail, got %v", err)
+	}
+}
+
+func TestProviderDiskFileSortsAfterManifest(t *testing.T) {
+	for _, device := range []string{"drive-efidisk0", "drive-scsi0", "-x", "0", "A", "_x"} {
+		name := ProviderDiskFile(device)
+		if name <= ProviderManifestFile {
+			t.Errorf("%s sorts before %s", name, ProviderManifestFile)
+		}
+		if got, ok := ParseProviderDiskFile(name); !ok || got != device {
+			t.Errorf("%s: parsed %q %v", name, got, ok)
+		}
+	}
+	for _, name := range []string{ProviderManifestFile, "drive-scsi0.raw", "vm-.raw", "vm-a/b.raw", "vm-.x.raw"} {
+		if _, ok := ParseProviderDiskFile(name); ok {
+			t.Errorf("%s must not parse as a disk", name)
+		}
 	}
 }
 
@@ -298,26 +376,6 @@ func TestFleecingStorage(t *testing.T) {
 		if got := tc.client.fleecingStorage(context.Background(), 100); got != tc.want {
 			t.Errorf("%s: got %q, want %q", name, got, tc.want)
 		}
-	}
-}
-
-func TestProviderRestoreCheckRunsBeforeUpload(t *testing.T) {
-	runner := &recordingRunner{files: map[string]*bytes.Buffer{}}
-	client := &Client{cfg: &Config{DumpDir: "/dump"}, runner: runner}
-	manifest := `{"version":1,"vmid":100,"devices":{"scsi0":{"size":4}}}`
-
-	var checked int
-	_, err := client.PrepareProviderRestore(context.Background(),
-		bytes.NewReader(providerArchive(t, manifest, map[string][]byte{"scsi0.raw": []byte("disk")})),
-		func(m ProviderManifest) error {
-			checked = m.VMID
-			return errors.New("target exists")
-		})
-	if err == nil || err.Error() != "target exists" || checked != 100 {
-		t.Fatalf("got %v, checked vmid %d", err, checked)
-	}
-	if len(runner.files) != 0 {
-		t.Fatal("nothing must be uploaded when the target is refused")
 	}
 }
 
