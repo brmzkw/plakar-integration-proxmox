@@ -29,10 +29,10 @@ else is executed.
 | `pvesh get /cluster/resources --type vm --output-format json` | once per job (cached 15 s) | VM/CT list for `all`, and the type, name, node and pool of each |
 | `pvesh get /version --output-format json`, `pvesm status --storage plakar`, `cat -- /usr/share/plakar-pve-provider/protocol` | a QEMU VM is selected | PVE 8.4 or later, provider storage active, same protocol as the provider |
 | `pvesm status --storage <fleecing_storage>`, or `cat -- /etc/vzdump.conf` without it | a QEMU VM is selected | fleecing storage active, or whether the node defaults enable fleecing |
-| `cat -- /etc/pve/qemu-server/<vmid>.conf` | each QEMU VM, when neither gives a fleecing storage | boot disk storage, used for fleecing |
+| `cat -- /etc/pve/qemu-server/<vmid>.conf` | each QEMU VM | disks to back up, and the boot disk storage used for fleecing when nothing else gives one |
 | `cat -- /etc/pve/lxc/<vmid>.conf` | each LXC CT | `_lxc.conf` sidecar |
 | `vzdump <vmid> --stdout --mode <backup_mode> --compress 0` | each LXC CT | dump streamed into Plakar |
-| `env PLAKAR_SESSION=<session> vzdump <vmid> --storage plakar --mode <backup_mode> [--fleecing enabled=1,storage=<storage>]` | each QEMU VM | provider backup, disks read over NBD |
+| `env PLAKAR_SESSION=<session> vzdump <vmid> --storage plakar --mode <backup_mode> [--fleecing enabled=1,storage=<storage>]` | each QEMU VM, when Plakar reads its first record | provider backup, disks read over NBD |
 | `rm -f -- /run/plakar/<session>.sock` | after each QEMU VM | remove the session socket |
 
 ## Restore (exporter)

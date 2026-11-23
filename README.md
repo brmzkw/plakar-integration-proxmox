@@ -32,7 +32,7 @@ $ plakar at /var/backups ls
 
 # The node to restore to, then restore
 $ plakar destination add pve-restore proxmox+backup://10.0.0.10 mode=remote conn_method=identity conn_username=root conn_identity_file=~/.ssh/pve_id
-$ plakar at /var/backups restore -to @pve-restore <snapid>
+$ plakar at /var/backups restore -o vmid=101 -to @pve-restore <snapid>
 ```
 
 If a VM or CT with the same VMID already exists on the target node, the restore is refused: remove
@@ -56,24 +56,24 @@ from its own source. Guests of a pool that run on another node are skipped with 
 
 ## Restoring
 
-A restore never overwrites an existing VM or CT unless you ask for it. To restore one guest out of a
-`pool` or `all` snapshot, give its directory:
+A restore brings back one VM or CT, chosen with `-o vmid=<id>` (required), whatever the snapshot
+holds. It never overwrites an existing VM or CT unless you ask for it.
 
 ```bash
-# One guest out of a pool or all snapshot
-$ plakar at /var/backups restore -to @pve-restore <snapid>:/backup/qemu/101_myvm
+# VM 101, out of a vmid, pool or all snapshot
+$ plakar at /var/backups restore -o vmid=101 -to @pve-restore <snapid>
 
 # Restore and start it
-$ plakar at /var/backups restore -o start_on_restore=true -to @pve-restore <snapid>
+$ plakar at /var/backups restore -o vmid=101 -o start_on_restore=true -to @pve-restore <snapid>
 
 # Restore under another VMID, on another storage
-$ plakar at /var/backups restore -o newid=201 -o storage=local-lvm -to @pve-restore <snapid>
+$ plakar at /var/backups restore -o vmid=101 -o newid=201 -o storage=local-lvm -to @pve-restore <snapid>
 
 # Restore a copy while the original still runs on the same network: new MAC addresses
-$ plakar at /var/backups restore -o newid=201 -o unique=true -to @pve-restore <snapid>
+$ plakar at /var/backups restore -o vmid=101 -o newid=201 -o unique=true -to @pve-restore <snapid>
 
 # Replace the existing guest (destructive, see the warning below)
-$ plakar at /var/backups restore -o force_vm_restore=true -to @pve-restore <snapid>
+$ plakar at /var/backups restore -o vmid=101 -o force_vm_restore=true -to @pve-restore <snapid>
 ```
 
 > [!WARNING]
@@ -83,6 +83,7 @@ $ plakar at /var/backups restore -o force_vm_restore=true -to @pve-restore <snap
 
 | Option | Default | Effect |
 |---|---|---|
+| `vmid` | required | the VM/CT to restore from the snapshot |
 | `force_vm_restore` | `false` | replace an existing VM/CT: stops it, destroys its disks and config (see the warning above) |
 | `start_on_restore` | `false` | start the VM/CT once restored |
 | `newid` | source VMID | restore under another VMID |
@@ -125,14 +126,15 @@ Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them i
 /backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar            container dump
 /backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_lxc.conf   its config
 /backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_pool.conf  its pool, if any
-/backup/qemu/<vmid>_<name>/qemu-<time>.tar                        manifest.json (config, pool) + one <device>.raw per disk
+/backup/qemu/<vmid>_<name>/qemu-<time>/manifest.json              VM config, firewall, pool, disk sizes
+/backup/qemu/<vmid>_<name>/qemu-<time>/vm-<device>.raw             one raw image per disk, e.g. vm-drive-scsi0.raw
 ```
 
 `<time>` is the backup start time on the machine running Plakar, as `YYYY_MM_DD-HH_MM_SS`.
 
 ## Disk space
 
-- A restore needs room in `dump_dir` for the whole archive (all disks of a QEMU VM) on the node.
+- A restore needs room in `dump_dir` for all disks of a QEMU VM, or the whole archive of a CT, on the node.
 - Plakar's own cache and packfiles can fill the machine running Plakar on large VMs. Move them with
   `plakar backup -cache <dir> -packfiles <dir>`.
 
