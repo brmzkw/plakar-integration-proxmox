@@ -23,6 +23,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
+
+	"github.com/dustin/go-humanize"
 )
 
 const FreeSpaceMargin = 256 << 20
@@ -169,7 +171,7 @@ func (c *Client) EnsureFreeSpace(ctx context.Context, dir string, size int64) er
 	required := size + FreeSpaceMargin
 	if available < required {
 		return fmt.Errorf("not enough free space in %s: %s available, %s required",
-			dir, humanBytes(available), humanBytes(required))
+			dir, humanize.IBytes(uint64(available)), humanize.IBytes(uint64(required)))
 	}
 	return nil
 }
@@ -191,18 +193,4 @@ func parseDfAvailable(output string) (int64, error) {
 		return 0, fmt.Errorf("invalid df available value %q", fields[3])
 	}
 	return blocks * 1024, nil
-}
-
-func humanBytes(size int64) string {
-	const unit = 1024
-	if size < unit {
-		return fmt.Sprintf("%d B", size)
-	}
-
-	div, exp := int64(unit), 0
-	for n := size / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
 }

@@ -19,20 +19,18 @@ package runner
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type SSHConfig struct {
@@ -126,52 +124,28 @@ func knownHostsCallback(knownHostsPath, addr string) (ssh.HostKeyCallback, error
 	_ = f.Close()
 
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		callback, err := knownhosts.New(knownHostsPath)
+		db, err := knownhosts.NewDB(knownHostsPath)
 		if err != nil {
 			return fmt.Errorf("unable to parse known_hosts %s: %w", knownHostsPath, err)
 		}
 
-		err = callback(hostname, remote, key)
-		var keyErr *knownhosts.KeyError
-		if err == nil || !errors.As(err, &keyErr) {
-			return err
-		}
-		if len(keyErr.Want) > 0 {
+		err = db.HostKeyCallback()(hostname, remote, key)
+		switch {
+		case knownhosts.IsHostKeyChanged(err):
 			return hostKeyMismatch(addr, knownHostsPath, key)
+		case knownhosts.IsHostUnknown(err):
+			return addKnownHost(knownHostsPath, addr, key)
 		}
-		return addKnownHost(knownHostsPath, addr, key)
+		return err
 	}, nil
 }
 
-type probeKey struct{}
-
-func (probeKey) Type() string                        { return "probe" }
-func (probeKey) Marshal() []byte                     { return []byte("probe") }
-func (probeKey) Verify([]byte, *ssh.Signature) error { return errors.New("probe key") }
-
 func knownHostKeyAlgorithms(knownHostsPath, addr string) []string {
-	callback, err := knownhosts.New(knownHostsPath)
+	db, err := knownhosts.NewDB(knownHostsPath)
 	if err != nil {
 		return nil
 	}
-	var keyErr *knownhosts.KeyError
-	if !errors.As(callback(addr, &net.TCPAddr{}, probeKey{}), &keyErr) {
-		return nil
-	}
-
-	var algos []string
-	for _, known := range keyErr.Want {
-		types := []string{known.Key.Type()}
-		if types[0] == ssh.KeyAlgoRSA {
-			types = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
-		}
-		for _, t := range types {
-			if !slices.Contains(algos, t) {
-				algos = append(algos, t)
-			}
-		}
-	}
-	return algos
+	return db.HostKeyAlgorithms(addr)
 }
 
 func addKnownHost(knownHostsPath, addr string, key ssh.PublicKey) error {
