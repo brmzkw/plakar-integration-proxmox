@@ -39,6 +39,38 @@ func StorageFromConfig(vmType string, configData []byte) string {
 	}
 }
 
+func ProviderDevices(configData []byte) []string {
+	devices := make([]string, 0)
+	for _, entry := range ActiveConfigEntries(configData) {
+		key, value := entry[0], entry[1]
+		if !qemuDiskKeyRegex.MatchString(key) && key != "efidisk0" && key != "tpmstate0" {
+			continue
+		}
+		if isCDROMVolume(value) || backupDisabled(value) {
+			continue
+		}
+		name := "drive-" + key
+		if key == "tpmstate0" {
+			name += "-backup"
+		}
+		devices = append(devices, name)
+	}
+	sort.Strings(devices)
+	return devices
+}
+
+func backupDisabled(spec string) bool {
+	for _, part := range strings.Split(spec, ",")[1:] {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(part), "backup="); ok {
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "0", "no", "off", "false":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func ActiveConfigEntries(configData []byte) [][2]string {
 	entries := make([][2]string, 0)
 
