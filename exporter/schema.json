@@ -90,6 +90,11 @@
       "description": "Delay between SSH retries when mode=remote, as a Go duration (e.g. \"2s\")",
       "default": "2s"
     },
+    "vmid": {
+      "type": "integer",
+      "description": "VM/CT to restore from the snapshot, required at restore time",
+      "minimum": 1
+    },
     "start_on_restore": {
       "type": "boolean",
       "description": "Start VM/CT after successful restore",
