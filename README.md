@@ -1,222 +1,144 @@
 # Proxmox Integration
 
-## Overview
+Back up Proxmox VE virtual machines (QEMU) and containers (LXC) with Plakar, and restore them
+to a Proxmox node.
 
-**Proxmox** (PVE) is a complete open-source platform for enterprise virtualization. With the built-in web interface you can easily manage VMs and containers, software-defined storage and networking, high-availability clustering, and multiple out-of-the-box tools using a single solution.
+## Install
 
-This integration allows:
+1. Build and install the plugin on the machine running Plakar:
+   ```bash
+   $ make install        # builds proxmox_<version>_<os>_<arch>.ptar and runs plakar pkg add on it
+   ```
+2. Install [plakar-pve-provider](https://github.com/gillesdubois/plakar-pve-provider)
+   on every node and declare its `plakar` storage. It needs Proxmox VE 8.4 or later. LXC containers
+   don't need it. See project's readme.
+3. Plakar either runs on the node itself (`mode=local`), or connects to it over SSH as `root`
+   (`mode=remote`, with `AllowStreamLocalForwarding` left at its OpenSSH default).
 
-* **Backup of virtual machines and containers:**
-  Backup and store vzdump coming from Proxmox virtual machines and containers.
-
-* **Virtual machines and containers restoration:**
-  Restore previously backed-up virtual machines and containers dumps directly into a proxmox instance.
-
-## Configuration
-
-The configuration parameters are as follows:
-- `mode` (required): Define how backup will be done, can be either `local` or `remote` : 
-    - `local` : Plakar is installed directly on the proxmox instance
-    - `remote`: Plakar is installed on a remote instance and need to connect in order to perform the backup
-- `conn_method` (required if mode : `remote`): Set how user will connect to the remote server : 
-    - `password` : Plakar will use standard ssh username / password combo to login
-    - `identity` : Plakar will use a private key to connect with the set username
-- `conn_username` (required if mode : `remote`): Proxmox user that will be used to connect and perform backup
-- `conn_password` (required if conn_method : `password` ): Password that will be used to connect remotely and perform the backup
-- `conn_identity_file` (required if conn_method : `identity` and `conn_identity_key` is not set): Identify key file path used to connect
-- `conn_identity_key` (required if conn_method : `identity` and `conn_identity_file` is not set): Private key content used to connect, mutually exclusive with `conn_identity_file`
-- `backup_compression` (optional): Backup compression mode used by proxmox when dumping the VM / CT (defaults to `0`) :
-    - `0` : No compression applied
-    - `1` : Proxmox default compression
-    - `lzo` : LZO compression applied 
-    - `gzip` : GZIP compression applied
-    - `zstd` : ZSTD compression applied 
-- `backup_mode` (optional): Backup mode used, will impact how VM / CT behave during backup (defaults to `snapshot`) : 
-    - `snapshot` : Use a snapshot mode without stopping or suspending VM / CT
-    - `suspend` : VM or CT will be suspended during the backup
-    - `stop` : Proxmox will stop the VM / CT in order to perform the backup
-- `dump_dir` (optional): Directory used by Proxmox to store dump archives (defaults to `/var/lib/vz/dump`). It is used for restore uploads and for backup generation in both modes.
-- `node` (optional): Proxmox node to target for restore/upload operations (required if your cluster has multiple nodes)
-- `cleanup` (optional): When `true`, delete temporary vzdump files from Proxmox storage after restore and after backups (defaults to `true`).
-- `ssh_retry_count` (optional, only used when `mode=remote`): Number of retries when an SSH action fails to open a channel/session (e.g. `ssh: rejected: connect failed (open failed)` on a stale connection). Defaults to `3`. Set to `0` to disable retries.
-- `ssh_retry_delay` (optional, only used when `mode=remote`): Delay to wait between SSH retries, as a Go duration (e.g. `2s`, `500ms`, `1m`). Defaults to `2s`.
-
-## Restore behavior and options
-
-During restore, the exporter checks whether the target VM/CT exists and its runtime state:
-
-- **If it exists and is running**: restore is refused unless `-o force_vm_restore=true`, in which case the VM/CT is stopped before restore.
-- **If it exists and is stopped**: restore is performed in place.
-- **If it does not exist**: restore is performed from the dump. When a matching sidecar config file (`_qemu.conf` or `_lxc.conf`) is available, it may be used as a storage hint for restore. When a matching pool sidecar (`_pool.conf`) is available, the exporter checks that the pool still exists and then passes `--pool <pool>`.
-- **After a successful restore**: the VM/CT is started when `-o start_on_restore=true`.
-- **Storage / pool override**:
-  - `-o storage=<name>` forces the storage target used by restore, overriding the sidecar hint.
-  - `-o pool=<name>` forces the pool used by restore, overriding the sidecar hint.
-
-Restore options are passed via the generic `-o` flag of `plakar restore`:
-
-- `start_on_restore=true|false` (`false` by default): start restored VM/CT after success.
-- `force_vm_restore=true|false` (`false` by default): if target VM/CT is running it is stopped; restore overwrites existing VM/CT when set.
-- `storage=<name>`: force target storage for restore.
-- `pool=<name>`: force target pool for restore.
-- `newid=<id>`: restore under another VMID than the one contained in the source dump.
-
-## Backup selection options
-
-Backup selection is passed via the generic `-o` flag of `plakar backup` and is forwarded to the importer as key/value options.
-You should set exactly one of the following:
-
-- `vmid=<id>`: backup a single VM/CT
-- `pool=<name>`: backup all VMs/CTs in a pool
-- `all` or `all=true`: backup everything
-
-## Disk Space and Cache Management
-
-When backing up large virtual machines or containers, temporary files and cache metadata can consume a significant amount of local disk space.
-
-There are two main areas of disk usage to consider:
-
-1. **Proxmox VZDump Temporary Files**:
-   By default, Proxmox creates a temporary dump in the directory configured by `dump_dir` (default: `/var/lib/vz/dump`). If `cleanup` is set to `true` (default), these files are automatically deleted after Plakar finishes importing them.
-
-2. **Plakar Cache and Stage Packfiles**:
-   Plakar stores metadata and indexes in a local cache (by default under `~/.cache/plakar`) and creates temporary "packfiles" on disk during backup operations before sending them to the repository.
-   When backing up large VMs, this cache and the temporary packfiles can quickly fill up the system partition. You can redirect them to a larger mount point using the following `plakar backup` subcommand flags:
-   - `-cache <path>`: Specifies a custom directory for the VFS cache. Set to `no` to disable caching, or `vfs` (default) for in-memory caching.
-   - `-packfiles <path>`: Specifies a directory where temporary packfiles will be staged. Set to `memory` (default) to build them entirely in RAM.
-
-## Backup File Structure
-
-Each backed-up VM/CT produces a dump object under `/backup/<type>/<vmid>_<vmname>/`:
-- `/backup/<type>/<vmid>_<vmname>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]`
-
-For VM configs, sidecar files are also added:
-- `/backup/<type>/<vmid>_<vmname>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_qemu.conf`
-- `/backup/<type>/<vmid>_<vmname>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_lxc.conf`
-- `/backup/<type>/<vmid>_<vmname>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_pool.conf`
-
-## Backup Example
-
-Example for a QEMU VM with `vmid=101` named `myvm` compressed with zstd:
-
-```text
-/backup/qemu/101_myvm/vzdump-qemu-101-2026_02_10-02_00_00.vma.zst
-```
-
-## Examples
+## Quick start
 
 ```bash
-# Configure a Proxmox local source
-$ plakar source add myProxmoxHypervisorLocal proxmox+backup://10.0.0.10 mode=local
+# Create the Plakar repository that will hold the backups (once)
+$ plakar at /var/backups create
 
-# Configure a Proxmox remote source (with password auth)
-$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass conn_method=password
+# The node to back up, over SSH with a key
+$ plakar source add pve proxmox+backup://10.0.0.10 mode=remote conn_method=identity conn_username=root conn_identity_file=~/.ssh/pve_id
 
-# Configure a Proxmox remote source (with identity auth)
-$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/somewhere/pmx_id conn_method=identity
+# Back up VM 101
+$ plakar at /var/backups backup -o vmid=101 @pve
 
-# Configure a Proxmox remote source with custom SSH retry behavior
-$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/somewhere/pmx_id conn_method=identity ssh_retry_count=5 ssh_retry_delay=5s
+# List the snapshots and note the ID of the one to restore
+$ plakar at /var/backups ls
 
-# Backup VM / CT
-$ plakar at /tmp/example backup -o vmid=101 @myProxmoxHypervisorSrc
-$ plakar at /tmp/example backup -o pool=prod @myProxmoxHypervisorSrc
-$ plakar at /tmp/example backup -o all @myProxmoxHypervisorSrc 
-$ plakar at /tmp/example backup -o vmid=101 -o cleanup=false @myProxmoxHypervisorSrc 
+# The node to restore to, then restore
+$ plakar destination add pve-restore proxmox+backup://10.0.0.10 mode=remote conn_method=identity conn_username=root conn_identity_file=~/.ssh/pve_id
+$ plakar at /var/backups restore -o vmid=101 -to @pve-restore <snapid>
+```
 
-# Backup VM / CT with custom cache and packfiles paths (redirected to a larger storage)
-$ plakar at /tmp/example backup -cache /mnt/large-disk/cache -packfiles /mnt/large-disk/packfiles -o vmid=101 @myProxmoxHypervisorSrc
+If a VM or CT with the same VMID already exists on the target node, the restore is refused: remove
+it first, or pass `-o force_vm_restore=true` (see [Restoring](#restoring)).
 
-# Configure a Proxmox local destination
-$ plakar destination add myProxmoxHypervisorLocal proxmox+backup://10.0.0.10 mode=local
+With Plakar installed on the node, use `mode=local` and no `conn_*` options. In `mode=local`,
+Plakar must run as `root` on the node.
 
-# Configure a Proxmox remote destination (with password auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass  conn_method=password
+## Choosing what to back up
 
-# Configure a Proxmox remote destination (with identity auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity
+Pass exactly one of these to `plakar backup`:
 
-# Restore backup to destination
-$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
+| Option | Backs up |
+|---|---|
+| `-o vmid=<id>` | one VM or CT |
+| `-o pool=<name>` | every VM and CT of the pool |
+| `-o all=true` | every VM and CT |
 
-# Restore one VM from a multi-VM snapshot by selecting its backup directory
-$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/backup/qemu/101_myvm
-# Restore and restart after restore
-$ plakar at /tmp/example restore -o start_on_restore=true -to @myProxmoxHypervisorRemote <snapid> 
-# Restore existing VM by force (stop first if needed)
-$ plakar at /tmp/example restore -o force_vm_restore=true -to @myProxmoxHypervisorRemote <snapid> 
-# Restore to a different VMID and storage
-$ plakar at /tmp/example restore -o newid=201 -o storage=local-lvm -o pool=sharedpool-to @myProxmoxHypervisorRemote <snapid> 
-``` 
+Only guests running on the node Plakar connects to are backed up. In a cluster, back up each node
+from its own source. Guests of a pool that run on another node are skipped with a warning.
 
-## Proxmox tools / commands used
+## Restoring
 
-This integration relies on Proxmox CLI tooling (`pvesh`, `vzdump`, `qmrestore`, `pct`).
+A restore brings back one VM or CT, chosen with `-o vmid=<id>` (required), whatever the snapshot
+holds. It never overwrites an existing VM or CT unless you ask for it.
 
-Commands are executed locally when `mode=local`, and via SSH when `mode=remote`.
+```bash
+# VM 101, out of a vmid, pool or all snapshot
+$ plakar at /var/backups restore -o vmid=101 -to @pve-restore <snapid>
 
-Backup (importer) commands:
-- `pvesh get /version --output-format json`
-- `pvesh get /cluster/resources --type vm --output-format json` (when `all`)
-- `pvesh get /pools/<pool> --output-format json` (when `pool=...`)
-- `vzdump <vmid> --dumpdir <dump_dir> --mode <snapshot|suspend|stop> --compress <0|1|lzo|gzip|zstd> [--node <node>]` (when `mode=local` and `mode=remote`)
-- `cat -- /etc/pve/qemu-server/<vmid>.conf` (for QEMU sidecar config file)
-- `cat -- /etc/pve/lxc/<vmid>.conf` (for LXC sidecar config file)
+# Restore and start it
+$ plakar at /var/backups restore -o vmid=101 -o start_on_restore=true -to @pve-restore <snapid>
 
-Restore (exporter) commands:
-- `cat > <dump_dir>/<archive>` (write archive to Proxmox storage)
-- `qm status <vmid>` / `pct status <vmid>` (check existence and running state)
-- `pvesh get /pools/<pool> --output-format json` (only when a `_pool.conf` sidecar is present)
-- `qmrestore <dump_dir>/<archive> <vmid> --force [--storage <storage>] [--pool <pool>]` (QEMU)
-- `pct restore <vmid> <dump_dir>/<archive> --force [--storage <storage>] [--pool <pool>]` (LXC)
-- `qm stop <vmid>` / `pct stop <vmid>` (when `-o force_vm_restore=true`)
-- `qm start <vmid>` / `pct start <vmid>` (only when `-o start_on_restore=true`)
-- `rm -f -- <dump_dir>/<archive>` (when `cleanup=true`)
+# Restore under another VMID, on another storage
+$ plakar at /var/backups restore -o vmid=101 -o newid=201 -o storage=local-lvm -to @pve-restore <snapid>
 
-## Technical / code overview 
+# Restore a copy while the original still runs on the same network: new MAC addresses
+$ plakar at /var/backups restore -o vmid=101 -o newid=201 -o unique=true -to @pve-restore <snapid>
 
-### Backup Flow (Importer)
+# Replace the existing guest (destructive, see the warning below)
+$ plakar at /var/backups restore -o vmid=101 -o force_vm_restore=true -to @pve-restore <snapid>
+```
 
-1. Read config and validate options (local/remote mode, SSH auth, compression, backup mode, node, etc.).
-2. Resolve VM/CT selection: `vmid`, `pool`, or `all`.
-3. Retrieve the list via `pvesh`:
-   `pvesh get /cluster/resources --type vm` or `pvesh get /pools/<pool>`.
-4. For each VM/CT, detect the type (`qemu` or `lxc`) via Proxmox inventory.
-5. For each VM/CT, run `vzdump` to generate a dump file in `dump_dir`.
-6. Read the dump file and send it to Plakar under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
-7. For QEMU and LXC, also export VM config files as sidecars:
-   - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `/backup/qemu/<vmid>_<vmname>/<dump>_qemu.conf`
-   - LXC: `/etc/pve/lxc/<vmid>.conf` as `/backup/lxc/<vmid>_<vmname>/<dump>_lxc.conf`
-8. If VM/CT belongs to a pool, export pool membership as `/backup/<type>/<vmid>_<vmname>/<dump>_pool.conf` (content is the pool name).
-9. `cleanup` option: generated dump file is removed from `dump_dir` after transfer (enabled by default).
+> [!WARNING]
+> `force_vm_restore=true` stops the target VM/CT, then **destroys its current disks and
+> configuration** and replaces them with the backup. Everything written since the backup is lost.
+> It applies to the target VMID, so combined with `newid` it destroys whatever guest owns that ID.
 
-### Restore Flow (Exporter)
+| Option | Default | Effect |
+|---|---|---|
+| `vmid` | required | the VM/CT to restore from the snapshot |
+| `force_vm_restore` | `false` | replace an existing VM/CT: stops it, destroys its disks and config (see the warning above) |
+| `start_on_restore` | `false` | start the VM/CT once restored |
+| `newid` | source VMID | restore under another VMID |
+| `unique` | `true` with `newid`, else `false` | new MAC addresses, and a new SMBIOS UUID for QEMU; set it when the original guest still runs on the same network, to avoid MAC/IP conflicts |
+| `storage` | storage of the boot disk (QEMU) or `rootfs` (LXC) | storage for **all** disks: a VM whose disks were on several storages comes back with all of them on one |
+| `pool` | the original one | pool to put the VM/CT in (it must exist) |
 
-1. Read snapshot files (dumps and optional sidecars).
-2. Collect sidecar configs (`_qemu.conf`, `_lxc.conf`) and map them to their dump names.
-3. For each dump file, parse the restore target from the filename (type + vmid), then write the dump into `dump_dir`.
-4. Check target existence and runtime state using `qm/pct status`.
-5. If VM/CT exists:
-   - if running: restore is refused unless `-o force_vm_restore=true`, in which case the VM/CT is stopped first.
-   - if stopped: restore dump in place.
-6. If VM/CT does not exist, restore dump directly.
-7. Restore options from `plakar restore -o` are applied:
-   - `start_on_restore=true|false` (`false` by default): start VM/CT after successful restore.
-   - `force_vm_restore=true|false` (`false` by default): if VM/CT is running, stop it before restore; if VM/CT exists, it is restored in place (overwrite).
-   - `storage=<name>`: force restore storage,
-   - `pool=<name>`: force restore pool (validated on target),
-   - `newid=<id>`: restore to another VMID.
-8. Storage/pool precedence:
-   - user-specified `storage` and `pool` override sidecar-derived hints when present.
-   - if target VMID does not exist and no override is set, storage and pool are read from matching sidecars when available.
-9. `cleanup` option: remove the temporary dump from `dump_dir`.
+If the pool recorded in the backup no longer exists, the guest is restored outside any pool, with a
+warning.
 
-### Remote Mode and SSH Notes
+## Configuration reference
 
-Remote mode exists to avoid installing extra binaries on the hypervisor and to centralize multiple Proxmox backups from a single "backup relay".
+Connection:
 
-A single SSH connection is kept open and reused for the whole backup/restore job (vzdump execution, archive read/write, config/pool sidecar reads, cleanup, ...). On a long-running job (e.g. a large LXC/QEMU dump taking tens of minutes), that connection can become stale (idle timeouts on a NAT/firewall/VPN sitting between Plakar and Proxmox, a heavily loaded Proxmox node, a flaky link, ...), which typically surfaces as an SSH channel-open failure such as:
+| Option | Required | Description |
+|---|---|---|
+| `mode` | yes | `local` (Plakar on the node) or `remote` (over SSH) |
+| `conn_method` | `remote` | `password` or `identity` |
+| `conn_username` | `remote` | SSH user, must be `root` |
+| `conn_password` | `password` | SSH password |
+| `conn_identity_file` | `identity` | path to the private key, or use `conn_identity_key` |
+| `conn_identity_key` | `identity` | private key content, or use `conn_identity_file` |
 
-To make this resilient, every SSH action (opening a channel to run a command, read/write a file, ...) is retried on failure: the SSH connection is re-dialed and the action is attempted again, up to `ssh_retry_count` times (default `3`), waiting `ssh_retry_delay` between attempts (default `2s`). Set `ssh_retry_count=0` to disable retries and fail immediately, as before.
+Advanced:
 
-Security (TODO ?) note: the SSH implementation currently disables host key verification (`InsecureIgnoreHostKey`). This keeps setup simple but trades away strict host identity checks. If you require stricter security, add host key verification before using remote mode in production.
+| Option | Default | Used by | Description |
+|---|---|---|---|
+| `backup_mode` | `snapshot` | backup | vzdump mode: `snapshot`, `suspend` or `stop` (stops the guest during the backup) |
+| `fleecing_storage` | `/etc/vzdump.conf`, else the VM's boot disk storage | backup | storage for the fleecing image of QEMU VMs (e.g. `local-lvm`), which Proxmox requires for provider backups; prefer a thin storage that supports discard |
+| `node` | the connected node | backup | safety check: refuse to run if the connected host is not this node |
+| `dump_dir` | `/var/lib/vz/dump` | restore | where archives and disk images are uploaded before the restore; they are always removed afterwards |
+| `ssh_retry_count` | `3` | `remote` | retries when an SSH channel fails to open, `0` to disable |
+| `ssh_retry_delay` | `2s` | `remote` | delay between SSH retries |
+
+Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them itself.
+
+## Snapshot layout
+
+```
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar            container dump
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_lxc.conf   its config
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_pool.conf  its pool, if any
+/qemu/<vmid>_<name>/manifest.json              VM config, firewall, pool, disk sizes
+/qemu/<vmid>_<name>/vm-<device>.raw             one raw image per disk, e.g. vm-drive-scsi0.raw
+```
+
+`<time>` is the backup start time on the machine running Plakar, as `YYYY_MM_DD-HH_MM_SS`.
+
+## Disk space
+
+- A restore needs room in `dump_dir` for all disks of a QEMU VM, or the whole archive of a CT, on the node.
+- Plakar's own cache and packfiles can fill the machine running Plakar on large VMs. Move them with
+  `plakar backup -cache <dir> -packfiles <dir>`.
+
+## Further reading
+
+- [COMMANDS.md](COMMANDS.md): every command run and file touched on the node.
+- [DESIGN.md](DESIGN.md): how backups and restores work inside.

@@ -21,7 +21,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +32,13 @@ import (
 	"github.com/PlakarKorp/kloset/connectors/exporter"
 	"github.com/PlakarKorp/kloset/location"
 	"github.com/gillesdubois/plakar-integration-proxmox/internal/proxmox"
+	"github.com/google/uuid"
 )
 
 type ProxmoxExporter struct {
 	cfg         *proxmox.Config
 	client      *proxmox.Client
+	temp        *proxmox.TempFiles
 	restoreOpts restoreOptions
 }
 
@@ -57,8 +61,11 @@ type vmRuntimeState struct {
 }
 
 type restoreOptions struct {
+	vmid           int
 	startOnRestore bool
 	forceVMRestore bool
+	unique         bool
+	uniqueSet      bool
 	newID          int
 	storage        string
 	pool           string
@@ -91,6 +98,7 @@ func NewProxmoxExporter(ctx context.Context, opts *connectors.Options, name stri
 	return &ProxmoxExporter{
 		cfg:         cfg,
 		client:      client,
+		temp:        proxmox.NewTempFiles(client),
 		restoreOpts: restoreOpts,
 	}, nil
 }
@@ -98,14 +106,39 @@ func NewProxmoxExporter(ctx context.Context, opts *connectors.Options, name stri
 func (p *ProxmoxExporter) Origin() string        { return p.cfg.Origin() }
 func (p *ProxmoxExporter) Type() string          { return protocolName }
 func (p *ProxmoxExporter) Root() string          { return "/" }
-func (p *ProxmoxExporter) Flags() location.Flags { return 0 }
+func (p *ProxmoxExporter) Flags() location.Flags { return location.FLAG_WALKDIRORDER }
 
 func (p *ProxmoxExporter) Ping(ctx context.Context) error {
-	return p.client.Ping(ctx)
+	if err := p.client.Ping(ctx); err != nil {
+		return err
+	}
+	return p.preflight(ctx)
+}
+
+func (p *ProxmoxExporter) preflight(ctx context.Context) error {
+	if err := p.client.CheckCommands(ctx, "pvesh", "qm", "pct", "qmrestore"); err != nil {
+		return err
+	}
+	return p.client.CheckDumpDir(ctx)
 }
 
 func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors.Record, results chan<- *connectors.Result) error {
 	defer close(results)
+
+	defer p.temp.Sweep(ctx)
+
+	if p.restoreOpts.vmid == 0 {
+		err := fmt.Errorf("missing vmid: pass -o vmid=<id> to choose the VM/CT to restore")
+		drainRecords(records, results, err)
+		return err
+	}
+	if err := p.preflight(ctx); err != nil {
+		drainRecords(records, results, err)
+		return err
+	}
+
+	run := &providerRun{p: p, ctx: ctx, results: results}
+	found := false
 
 	sidecars := make(map[string]vmConfigSidecar)
 	poolSidecars := make(map[string]string)
@@ -122,23 +155,19 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
-		base := path.Base(record.Pathname)
-		if proxmox.IsConfigSidecarFilename(base) {
-			if err := p.collectConfigSidecar(record, base, sidecars); err != nil {
-				_ = closeRecord(record)
-				results <- resultFromRecord(record, err)
-				continue
-			}
-			results <- resultFromRecord(record, nil)
+		if isProviderFile(path.Base(record.Pathname)) {
+			run.handle(record)
 			continue
 		}
-		if proxmox.IsPoolSidecarFilename(base) {
-			if err := p.collectPoolSidecar(record, base, poolSidecars); err != nil {
+
+		base := path.Base(record.Pathname)
+
+		if dumpBase, kind, ok := proxmox.ParseSidecarFilename(base); ok {
+			err := collectSidecar(record, dumpBase, kind, sidecars, poolSidecars)
+			if err != nil {
 				_ = closeRecord(record)
-				results <- resultFromRecord(record, err)
-				continue
 			}
-			results <- resultFromRecord(record, nil)
+			results <- resultFromRecord(record, err)
 			continue
 		}
 
@@ -151,9 +180,26 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			results <- record.Ok()
 			continue
 		}
+		if vmid != p.restoreOpts.vmid {
+			_ = closeRecord(record)
+			results <- record.Ok()
+			continue
+		}
+		found = true
+
+		if err := p.checkTarget(ctx, vmType, p.targetVMID(vmid)); err != nil {
+			results <- record.Error(err)
+			continue
+		}
+		if err := p.client.EnsureFreeSpace(ctx, p.cfg.DumpDir, record.FileInfo.Lsize); err != nil {
+			results <- record.Error(err)
+			continue
+		}
 
 		dumpName := proxmox.BuildRestoreDumpFilename(base, vmType, vmid, time.Now())
 		dumpPath := path.Join(p.cfg.DumpDir, dumpName)
+
+		p.temp.Track(dumpPath)
 		if err := p.writeDump(ctx, dumpPath, record.Reader); err != nil {
 			results <- record.Error(err)
 			continue
@@ -172,6 +218,7 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			dumpPath: dumpPath,
 		})
 	}
+	run.end()
 
 	for _, pending := range pendingRestores {
 		if err := ctx.Err(); err != nil {
@@ -194,8 +241,9 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			}
 		}
 
-		if err == nil && p.cfg.Cleanup {
-			if removeErr := p.client.Remove(ctx, pending.dumpPath); removeErr != nil {
+		if removeErr := p.temp.Remove(ctx, pending.dumpPath); removeErr != nil {
+			log.Printf("unable to remove temporary dump %s: %v", pending.dumpPath, removeErr)
+			if err == nil {
 				err = removeErr
 			}
 		}
@@ -203,11 +251,148 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 		results <- resultFromRecord(pending.record, err)
 	}
 
+	if !found && !run.found {
+		return fmt.Errorf("no backup of VM/CT %d in this snapshot", p.restoreOpts.vmid)
+	}
 	return nil
 }
 
+func isProviderFile(base string) bool {
+	_, ok := proxmox.ParseProviderDiskFile(base)
+	return ok || base == proxmox.ProviderManifestFile
+}
+
+type providerRun struct {
+	p       *ProxmoxExporter
+	ctx     context.Context
+	results chan<- *connectors.Result
+	found   bool
+	current *providerSession
+}
+
+type providerSession struct {
+	dir      string
+	manifest *connectors.Record
+	restore  *proxmox.ProviderRestore
+	err      error
+}
+
+func (r *providerRun) handle(record *connectors.Record) {
+	dir, base := path.Split(record.Pathname)
+	if r.current != nil && r.current.dir != dir {
+		r.end()
+	}
+
+	if base == proxmox.ProviderManifestFile {
+		r.start(dir, record)
+		return
+	}
+
+	device, ok := proxmox.ParseProviderDiskFile(base)
+	if !ok || (r.current != nil && r.current.manifest == nil) {
+		_ = closeRecord(record)
+		r.results <- record.Ok()
+		return
+	}
+	if r.current == nil {
+		_ = closeRecord(record)
+		r.results <- record.Error(fmt.Errorf("%s comes before its %s", record.Pathname, proxmox.ProviderManifestFile))
+		return
+	}
+
+	s := r.current
+	if s.restore == nil {
+		_ = closeRecord(record)
+		r.results <- record.Ok()
+		return
+	}
+	err := s.restore.AddDisk(r.ctx, device, record.FileInfo.Lsize, record.Reader)
+	if closeErr := closeRecord(record); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		s.fail(err)
+	}
+	r.results <- resultFromRecord(record, err)
+	if s.restore != nil && s.restore.Complete() {
+		r.end()
+	}
+}
+
+func (r *providerRun) start(dir string, record *connectors.Record) {
+	s := &providerSession{dir: dir}
+	r.current = s
+
+	var m proxmox.ProviderManifest
+	var err error
+	if record.FileInfo.Lsize > proxmox.MaxProviderManifest {
+		_ = closeRecord(record)
+		err = fmt.Errorf("%s is too large", record.Pathname)
+	} else {
+		var data []byte
+		if data, err = readRecordBytes(record); err == nil {
+			m, err = proxmox.ParseProviderManifest(data)
+		}
+	}
+	if err == nil && m.VMID != r.p.restoreOpts.vmid {
+		r.results <- record.Ok()
+		return
+	}
+
+	r.found = true
+	s.manifest = record
+	if err == nil {
+		err = r.p.client.CheckProvider(r.ctx)
+	}
+	if err == nil {
+		err = r.p.checkTarget(r.ctx, "qemu", r.p.targetVMID(m.VMID))
+	}
+	if err == nil {
+		s.restore, err = r.p.client.PrepareProviderRestore(r.ctx, m)
+	}
+	s.err = err
+}
+
+func (s *providerSession) fail(err error) {
+	if s.err == nil {
+		s.err = err
+	}
+	if s.restore != nil {
+		s.restore.Close()
+		s.restore = nil
+	}
+}
+
+func (r *providerRun) end() {
+	s := r.current
+	if s == nil {
+		return
+	}
+	r.current = nil
+
+	if s.restore != nil {
+		err := s.restore.Finish(r.ctx)
+		if err == nil {
+			m := s.restore.Manifest
+			err = r.p.restoreDump(r.ctx, s.restore.Volume, "qemu", r.p.targetVMID(m.VMID), []byte(m.GuestConfig), m.Pool)
+		}
+		s.fail(err)
+	}
+	if s.manifest != nil {
+		r.results <- resultFromRecord(s.manifest, s.err)
+	}
+}
+
 func (p *ProxmoxExporter) Close(ctx context.Context) error {
+	p.temp.Sweep(ctx)
 	return p.client.Close()
+}
+
+// drainRecords fails every remaining record: the SDK blocks until all are consumed.
+func drainRecords(records <-chan *connectors.Record, results chan<- *connectors.Result, err error) {
+	for record := range records {
+		results <- record.Error(err)
+	}
 }
 
 func (p *ProxmoxExporter) writeDump(ctx context.Context, dumpPath string, reader io.Reader) error {
@@ -223,20 +408,20 @@ func (p *ProxmoxExporter) writeDump(ctx context.Context, dumpPath string, reader
 	return writer.Close()
 }
 
-func (p *ProxmoxExporter) collectConfigSidecar(record *connectors.Record, sidecarBase string, sidecars map[string]vmConfigSidecar) error {
-	dumpBase, vmType, err := proxmox.ParseConfigSidecarFilename(sidecarBase)
+func collectSidecar(record *connectors.Record, dumpBase, kind string, sidecars map[string]vmConfigSidecar, poolSidecars map[string]string) error {
+	if dumpBase == "" {
+		return fmt.Errorf("invalid %s sidecar filename: %s", kind, path.Base(record.Pathname))
+	}
+
+	data, err := readRecordBytes(record)
 	if err != nil {
 		return err
 	}
 
-	configData, err := readRecordBytes(record)
-	if err != nil {
-		return err
-	}
-
-	sidecars[dumpBase] = vmConfigSidecar{
-		vmType: vmType,
-		data:   configData,
+	if kind == proxmox.SidecarPool {
+		poolSidecars[dumpBase] = strings.TrimSpace(string(data))
+	} else {
+		sidecars[dumpBase] = vmConfigSidecar{vmType: kind, data: data}
 	}
 	return nil
 }
@@ -252,20 +437,6 @@ func (p *ProxmoxExporter) resolveConfigForDump(pending pendingRestore, sidecars 
 	return sidecar.data, nil
 }
 
-func (p *ProxmoxExporter) collectPoolSidecar(record *connectors.Record, sidecarBase string, sidecars map[string]string) error {
-	dumpBase, err := proxmox.ParsePoolSidecarFilename(sidecarBase)
-	if err != nil {
-		return err
-	}
-
-	poolData, err := readRecordBytes(record)
-	if err != nil {
-		return err
-	}
-	sidecars[dumpBase] = strings.TrimSpace(string(poolData))
-	return nil
-}
-
 func (p *ProxmoxExporter) resolvePoolForDump(pending pendingRestore, sidecars map[string]string) (string, error) {
 	poolName, ok := sidecars[pending.dumpBase]
 	if !ok {
@@ -274,26 +445,35 @@ func (p *ProxmoxExporter) resolvePoolForDump(pending pendingRestore, sidecars ma
 	return strings.TrimSpace(poolName), nil
 }
 
-func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte, poolName string) error {
+func (p *ProxmoxExporter) targetVMID(vmid int) int {
+	if p.restoreOpts.newID != 0 {
+		return p.restoreOpts.newID
+	}
+	return vmid
+}
+
+func (p *ProxmoxExporter) errTargetExists(vmType string, vmid int) error {
+	return fmt.Errorf("refusing restore for %s %d: it already exists on %s (pass -o force_vm_restore=true to overwrite it, or -o newid=<id> to restore next to it)", vmType, vmid, p.cfg.Origin())
+}
+
+func (p *ProxmoxExporter) checkTarget(ctx context.Context, vmType string, vmid int) error {
+	if p.restoreOpts.forceVMRestore {
+		return nil
+	}
 	state, err := p.vmState(ctx, vmType, vmid)
 	if err != nil {
 		return err
 	}
+	if state.exists {
+		return p.errTargetExists(vmType, vmid)
+	}
+	return nil
+}
 
-	if state.exists && state.running {
-		if !p.restoreOpts.forceVMRestore {
-			return fmt.Errorf("refusing restore for %s %d: VM/CT is running (stop it first or user force_vm_restore)", vmType, vmid)
-		}
-		if err := p.stopVM(ctx, vmType, vmid); err != nil {
-			return err
-		}
-		state, err = p.vmState(ctx, vmType, vmid)
-		if err != nil {
-			return err
-		}
-		if state.running {
-			return fmt.Errorf("refusing restore for %s %d: VM/CT is still running after stop request", vmType, vmid)
-		}
+func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte, poolName string) error {
+	state, err := p.vmState(ctx, vmType, vmid)
+	if err != nil {
+		return err
 	}
 
 	opts, err := p.resolveRestoreOptions(ctx, vmType, state.exists, configData, poolName)
@@ -301,8 +481,33 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 		return err
 	}
 
+	if state.exists {
+		if !p.restoreOpts.forceVMRestore {
+			return p.errTargetExists(vmType, vmid)
+		}
+
+		if state.running {
+			if err := p.stopVM(ctx, vmType, vmid); err != nil {
+				return err
+			}
+			state, err = p.vmState(ctx, vmType, vmid)
+			if err != nil {
+				return err
+			}
+			if state.running {
+				return fmt.Errorf("refusing restore for %s %d: VM/CT is still running after stop request", vmType, vmid)
+			}
+		}
+	}
+
 	if err := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts); err != nil {
 		return err
+	}
+
+	if opts.unique && vmType == "qemu" {
+		if err := p.regenerateSMBIOSUUID(ctx, vmid); err != nil {
+			return err
+		}
 	}
 
 	if p.restoreOpts.startOnRestore {
@@ -317,9 +522,13 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 func (p *ProxmoxExporter) resolveRestoreOptions(ctx context.Context, vmType string, targetExists bool, configData []byte, poolName string) (restoreOptions, error) {
 	opts := p.restoreOpts
 
+	if !opts.uniqueSet {
+		opts.unique = opts.newID != 0
+	}
+
 	if !targetExists {
 		if opts.storage == "" {
-			opts.storage = parseStorageFromConfig(vmType, configData)
+			opts.storage = proxmox.StorageFromConfig(vmType, configData)
 		}
 		if opts.pool == "" && poolName != "" {
 			exists, err := p.client.PoolExists(ctx, poolName)
@@ -328,6 +537,8 @@ func (p *ProxmoxExporter) resolveRestoreOptions(ctx context.Context, vmType stri
 			}
 			if exists {
 				opts.pool = poolName
+			} else {
+				log.Printf("pool %q recorded in the backup no longer exists on %s: the restored VM/CT will not belong to any pool (use -o pool=<name> to pick another one)", poolName, p.cfg.Origin())
 			}
 		}
 	}
@@ -352,12 +563,19 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 	switch vmType {
 	case "qemu":
 		cmd = "qmrestore"
-		args = []string{dumpPath, vmidStr, "--force"}
+		args = []string{dumpPath, vmidStr}
 	case "lxc":
 		cmd = "pct"
-		args = []string{"restore", vmidStr, dumpPath, "--force"}
+		args = []string{"restore", vmidStr, dumpPath}
 	default:
 		return fmt.Errorf("unsupported backup type: %s", vmType)
+	}
+
+	if opts.forceVMRestore {
+		args = append(args, "--force")
+	}
+	if opts.unique {
+		args = append(args, "--unique")
 	}
 	if opts.storage != "" {
 		args = append(args, "--storage", opts.storage)
@@ -372,6 +590,50 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 	}
 
 	return nil
+}
+
+func (p *ProxmoxExporter) regenerateSMBIOSUUID(ctx context.Context, vmid int) error {
+	configData, err := p.client.ReadQEMUConfig(ctx, vmid)
+	if err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but its smbios settings could not be read: %w", vmid, err)
+	}
+
+	smbios, err := uniqueSMBIOS(configData)
+	if err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but a new smbios uuid could not be generated: %w", vmid, err)
+	}
+
+	if _, stderr, err := p.client.Run(ctx, "qm", "set", strconv.Itoa(vmid), "--smbios1", smbios); err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but its smbios uuid could not be replaced: %w: %s", vmid, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+func uniqueSMBIOS(configData []byte) (string, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+
+	var current string
+	for _, entry := range proxmox.ActiveConfigEntries(configData) {
+		if entry[0] == "smbios1" {
+			current = entry[1]
+			break
+		}
+	}
+	if current == "" {
+		return "uuid=" + id.String(), nil
+	}
+
+	fields := strings.Split(current, ",")
+	for i, field := range fields {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(field)), "uuid=") {
+			fields[i] = "uuid=" + id.String()
+			return strings.Join(fields, ","), nil
+		}
+	}
+	return strings.Join(append(fields, "uuid="+id.String()), ","), nil
 }
 
 func (p *ProxmoxExporter) vmState(ctx context.Context, vmType string, vmid int) (vmRuntimeState, error) {
@@ -476,11 +738,10 @@ func isIgnorableStartError(output string) bool {
 
 func isIgnorableStopError(output string) bool {
 	normalized := strings.ToLower(output)
-	return strings.Contains(normalized, "already stopped") ||
-		strings.Contains(normalized, "already down") ||
-		strings.Contains(normalized, "does not exist") ||
-		strings.Contains(normalized, "no such vm") ||
-		strings.Contains(normalized, "no such container")
+	if strings.Contains(normalized, "already stopped") || strings.Contains(normalized, "already down") {
+		return true
+	}
+	return isMissingVMError(output)
 }
 
 func parseBoolOption(value string) (bool, error) {
@@ -510,6 +771,23 @@ func parseRestoreOptions(config map[string]string) (restoreOptions, error) {
 	}
 	opts.forceVMRestore = forceVMRestore
 
+	if uniqueRaw, ok := config["unique"]; ok && strings.TrimSpace(uniqueRaw) != "" {
+		unique, err := parseBoolOption(uniqueRaw)
+		if err != nil {
+			return restoreOptions{}, fmt.Errorf("invalid unique value: %s", strings.TrimSpace(uniqueRaw))
+		}
+		opts.unique = unique
+		opts.uniqueSet = true
+	}
+
+	if vmidRaw := strings.TrimSpace(config["vmid"]); vmidRaw != "" {
+		vmid, err := strconv.Atoi(vmidRaw)
+		if err != nil || vmid <= 0 {
+			return restoreOptions{}, fmt.Errorf("vmid must be a positive integer: %s", vmidRaw)
+		}
+		opts.vmid = vmid
+	}
+
 	opts.storage = strings.TrimSpace(config["storage"])
 	opts.pool = strings.TrimSpace(config["pool"])
 
@@ -531,15 +809,24 @@ func parseRestoreOptions(config map[string]string) (restoreOptions, error) {
 	return opts, nil
 }
 
+var missingVMPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)configuration file '[^']*' does not exist`),
+	regexp.MustCompile(`(?i)unable to find configuration file for (vm|ct) \d+`),
+	regexp.MustCompile(`(?i)\b(vm|ct|container) \d+ does not exist\b`),
+	regexp.MustCompile(`(?i)\bno such (vm|container)\b`),
+}
+
 func isMissingVMError(output string) bool {
-	if output == "" {
+	if strings.TrimSpace(output) == "" {
 		return false
 	}
-	normalized := strings.ToLower(output)
-	return strings.Contains(normalized, "does not exist") ||
-		strings.Contains(normalized, "no such vm") ||
-		strings.Contains(normalized, "no such container") ||
-		strings.Contains(normalized, "configuration file")
+
+	for _, pattern := range missingVMPatterns {
+		if pattern.MatchString(output) {
+			return true
+		}
+	}
+	return false
 }
 
 func preferredOutput(stdout, stderr string) string {
@@ -558,81 +845,6 @@ func parseStatusValue(output string) string {
 		}
 	}
 	return ""
-}
-
-func parseStorageFromConfig(vmType string, configData []byte) string {
-	if len(configData) == 0 {
-		return ""
-	}
-
-	for _, line := range strings.Split(string(configData), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(strings.ToLower(key))
-		value = strings.TrimSpace(value)
-
-		switch vmType {
-		case "lxc":
-			if key == "rootfs" {
-				if storage := parseStorageFromVolumeSpec(value); storage != "" {
-					return storage
-				}
-			}
-		case "qemu":
-			if !isQEMUDiskConfigKey(key) {
-				continue
-			}
-			if storage := parseStorageFromVolumeSpec(value); storage != "" {
-				return storage
-			}
-		}
-	}
-
-	return ""
-}
-
-func parseStorageFromVolumeSpec(spec string) string {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return ""
-	}
-
-	volume := strings.Split(spec, ",")[0]
-	volume = strings.TrimSpace(volume)
-	if volume == "" {
-		return ""
-	}
-
-	storage, _, ok := strings.Cut(volume, ":")
-	if !ok {
-		return ""
-	}
-	storage = strings.TrimSpace(storage)
-	if storage == "" {
-		return ""
-	}
-
-	// Ignore explicit "none" values used in some optional disk entries.
-	if strings.EqualFold(storage, "none") {
-		return ""
-	}
-	return storage
-}
-
-func isQEMUDiskConfigKey(key string) bool {
-	return strings.HasPrefix(key, "scsi") ||
-		strings.HasPrefix(key, "virtio") ||
-		strings.HasPrefix(key, "sata") ||
-		strings.HasPrefix(key, "ide") ||
-		strings.HasPrefix(key, "efidisk") ||
-		strings.HasPrefix(key, "tpmstate")
 }
 
 func readRecordBytes(record *connectors.Record) ([]byte, error) {

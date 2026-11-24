@@ -20,15 +20,20 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gillesdubois/plakar-integration-proxmox/internal/runner"
 )
 
 type Client struct {
 	cfg    *Config
-	runner Runner
+	runner runner.Runner
+
+	vzdumpMu sync.Mutex
+
+	fleecingOnBootDisk bool
 
 	resourceCacheMu sync.Mutex
 	resourceCache   []vmResource
@@ -36,11 +41,23 @@ type Client struct {
 }
 
 func NewClient(cfg *Config) (*Client, error) {
-	runner, err := NewRunner(cfg)
+	if cfg.Mode == ModeLocal {
+		return &Client{cfg: cfg, runner: &runner.Local{}}, nil
+	}
+
+	ssh, err := runner.NewSSH(runner.SSHConfig{
+		Host:         cfg.Host,
+		User:         cfg.ConnUsername,
+		Password:     cfg.ConnPassword,
+		IdentityFile: cfg.ConnIdentityFile,
+		IdentityKey:  cfg.ConnIdentityKey,
+		RetryCount:   cfg.SSHRetryCount,
+		RetryDelay:   cfg.SSHRetryDelay,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg, runner: runner}, nil
+	return &Client{cfg: cfg, runner: ssh}, nil
 }
 
 func (c *Client) Close() error {
@@ -61,10 +78,6 @@ func (c *Client) Open(ctx context.Context, filepath string) (io.ReadCloser, erro
 
 func (c *Client) Create(ctx context.Context, filepath string) (io.WriteCloser, error) {
 	return c.runner.Create(ctx, filepath)
-}
-
-func (c *Client) Stat(ctx context.Context, filepath string) (os.FileInfo, error) {
-	return c.runner.Stat(ctx, filepath)
 }
 
 func (c *Client) Remove(ctx context.Context, filepath string) error {

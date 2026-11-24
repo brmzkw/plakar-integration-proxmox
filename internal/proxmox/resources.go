@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -28,14 +29,16 @@ import (
 const resourceCacheTTL = 15 * time.Second
 
 type vmResource struct {
-	VMID int    `json:"vmid"`
-	Type string `json:"type"`
-	Node string `json:"node"`
-	Name string `json:"name,omitempty"`
-	Pool string `json:"pool,omitempty"`
+	VMID   int    `json:"vmid"`
+	Type   string `json:"type"`
+	Node   string `json:"node"`
+	Name   string `json:"name,omitempty"`
+	Pool   string `json:"pool,omitempty"`
+	Status string `json:"status,omitempty"`
 }
 
 type poolResponse struct {
+	PoolID  string       `json:"poolid"`
 	Members []vmResource `json:"members"`
 }
 
@@ -44,7 +47,7 @@ func (c *Client) ListAllVMIDs(ctx context.Context) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	return filterVMIDs(resources, c.cfg.Node), nil
+	return filterVMIDs(resources, c.cfg.Node, false), nil
 }
 
 func (c *Client) VMType(ctx context.Context, vmid int) (string, error) {
@@ -77,46 +80,54 @@ func (c *Client) PoolExists(ctx context.Context, pool string) (bool, error) {
 		return false, nil
 	}
 
-	_, err := c.runPvesh(ctx, "pvesh get pool failed", "get", "/pools/"+pool, "--output-format", "json")
+	stdout, err := c.runPvesh(ctx, "pvesh get pools failed", "get", "/pools", "--output-format", "json")
 	if err != nil {
-		if isMissingPoolError(err.Error()) {
-			return false, nil
-		}
 		return false, err
 	}
-	return true, nil
-}
-
-func isMissingPoolError(output string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(output))
-	if normalized == "" {
-		return false
+	var pools []poolResponse
+	if err := json.Unmarshal([]byte(stdout), &pools); err != nil {
+		return false, fmt.Errorf("failed to parse pools: %w", err)
 	}
-	return strings.Contains(normalized, "does not exist") ||
-		strings.Contains(normalized, "not found") ||
-		strings.Contains(normalized, "no such")
+	for _, p := range pools {
+		if p.PoolID == pool {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (c *Client) ListPoolVMIDs(ctx context.Context, pool string) ([]int, error) {
-	stdout, err := c.runPvesh(ctx, "pvesh get pool failed", "get", "/pools/"+pool, "--output-format", "json")
+	stdout, err := c.runPvesh(ctx, "pvesh get pool failed", "get", "/pools", "--poolid", pool, "--output-format", "json")
 	if err != nil {
 		return nil, err
 	}
 
-	var response poolResponse
-	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+	var pools []poolResponse
+	if err := json.Unmarshal([]byte(stdout), &pools); err != nil {
 		return nil, fmt.Errorf("failed to parse pool response: %w", err)
 	}
-	return filterVMIDs(response.Members, c.cfg.Node), nil
+	if len(pools) != 1 {
+		return nil, fmt.Errorf("pool %s not found", pool)
+	}
+	return filterVMIDs(pools[0].Members, c.cfg.Node, true), nil
 }
 
-func filterVMIDs(resources []vmResource, node string) []int {
+func filterVMIDs(resources []vmResource, node string, warnOtherNodes bool) []int {
 	set := make(map[int]struct{})
+
 	for _, item := range resources {
 		if item.Type != "qemu" && item.Type != "lxc" {
 			continue
 		}
 		if node != "" && item.Node != node {
+			if warnOtherNodes {
+				log.Printf("skipping %s %d: it runs on node %q, back it up from that node", item.Type, item.VMID, item.Node)
+			}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(item.Status), "unknown") {
+			log.Printf("skipping %s %d on node %q: the cluster reports its status as unknown (node unreachable?)",
+				item.Type, item.VMID, item.Node)
 			continue
 		}
 		set[item.VMID] = struct{}{}
@@ -137,15 +148,13 @@ func (c *Client) vmResourceByID(ctx context.Context, vmid int) (vmResource, erro
 	}
 
 	for _, res := range resources {
-		if res.VMID != vmid {
+		if res.VMID != vmid || (res.Type != "qemu" && res.Type != "lxc") {
 			continue
 		}
 		if c.cfg.Node != "" && res.Node != c.cfg.Node {
-			continue
+			return vmResource{}, fmt.Errorf("%s %d runs on node %s, not on %s: back it up from that node", res.Type, vmid, res.Node, c.cfg.Node)
 		}
-		if res.Type == "qemu" || res.Type == "lxc" {
-			return res, nil
-		}
+		return res, nil
 	}
 
 	return vmResource{}, fmt.Errorf("unable to determine VM resource for vmid %d", vmid)

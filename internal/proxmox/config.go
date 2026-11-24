@@ -34,6 +34,11 @@ const (
 )
 
 const (
+	ProviderStorage     = "plakar"
+	ProviderSessionRoot = "/run/plakar"
+)
+
+const (
 	ModeLocal  = "local"
 	ModeRemote = "remote"
 )
@@ -47,19 +52,18 @@ type Config struct {
 	Location *url.URL
 	Host     string
 
-	Mode              string
-	ConnMethod        string
-	ConnUsername      string
-	ConnPassword      string
-	ConnIdentityFile  string
-	ConnIdentityKey   string
-	DumpDir           string
-	BackupCompression string
-	BackupMode        string
-	Node              string
-	Cleanup           bool
-	SSHRetryCount     int
-	SSHRetryDelay     time.Duration
+	Mode             string
+	ConnMethod       string
+	ConnUsername     string
+	ConnPassword     string
+	ConnIdentityFile string
+	ConnIdentityKey  string
+	DumpDir          string
+	BackupMode       string
+	FleecingStorage  string
+	Node             string
+	SSHRetryCount    int
+	SSHRetryDelay    time.Duration
 }
 
 func ParseConfig(config map[string]string) (*Config, error) {
@@ -138,23 +142,13 @@ func ParseConfig(config map[string]string) (*Config, error) {
 		}
 	}
 
-	cfg.BackupCompression = strings.TrimSpace(config["backup_compression"])
-	if cfg.BackupCompression == "" {
-		cfg.BackupCompression = "0"
-	}
-
 	cfg.BackupMode = strings.TrimSpace(config["backup_mode"])
 	if cfg.BackupMode == "" {
 		cfg.BackupMode = "snapshot"
 	}
 
+	cfg.FleecingStorage = strings.TrimSpace(config["fleecing_storage"])
 	cfg.Node = strings.TrimSpace(config["node"])
-
-	cleanup, err := parseBool(config, "cleanup", true)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Cleanup = cleanup
 
 	sshRetryCount, err := parseInt(config, "ssh_retry_count", DefaultSSHRetryCount)
 	if err != nil {
@@ -182,18 +176,6 @@ func (c *Config) Origin() string {
 		return c.Host
 	}
 	return "local"
-}
-
-func parseBool(config map[string]string, key string, defaultValue bool) (bool, error) {
-	value := strings.TrimSpace(config[key])
-	if value == "" {
-		return defaultValue, nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("invalid %s value: %s", key, value)
-	}
-	return parsed, nil
 }
 
 func parseInt(config map[string]string, key string, defaultValue int) (int, error) {

@@ -22,60 +22,37 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PlakarKorp/kloset/connectors"
 )
+
+const DumpTimeFormat = "2006_01_02-15_04_05"
 
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
-func (c *Client) BackupVM(ctx context.Context, vmid int) (string, error) {
-	args := []string{strconv.Itoa(vmid), "--dumpdir", c.cfg.DumpDir, "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
-	if c.cfg.Node != "" {
-		args = append(args, "--node", c.cfg.Node)
-	}
+func (c *Client) BackupLXCStream(ctx context.Context, vmid int) (string, io.ReadCloser) {
+	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", "0"}
+	archiveName := fmt.Sprintf("vzdump-lxc-%d-%s.tar", vmid, time.Now().Format(DumpTimeFormat))
 
-	stdout, stderr, err := c.runner.Run(ctx, "vzdump", args...)
-	if err != nil {
-		return "", fmt.Errorf("vzdump failed: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	archive := parseArchivePath(stdout + "\n" + stderr)
-	if archive != "" {
-		return archive, nil
-	}
-
-	fallback, err := c.findLatestDump(ctx, vmid)
-	if err != nil {
-		return "", err
-	}
-	if fallback == "" {
-		return "", fmt.Errorf("unable to determine vzdump output file")
-	}
-	return fallback, nil
+	return archiveName, connectors.NewLazyReader(func() (io.ReadCloser, error) {
+		return c.startVzdump(ctx, args)
+	})
 }
 
-func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadCloser, *int64, error) {
-	vmType, err := c.VMType(ctx, vmid)
-	if err != nil {
-		return "", nil, nil, err
+func (c *Client) startVzdump(ctx context.Context, args []string) (io.ReadCloser, error) {
+	c.vzdumpMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.vzdumpMu.Unlock()
+		return nil, err
 	}
-
-	baseExt, err := dumpBaseExtension(vmType)
-	if err != nil {
-		return "", nil, nil, err
-	}
-
-	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
-	if c.cfg.Node != "" {
-		args = append(args, "--node", c.cfg.Node)
-	}
-
 	stream, err := c.runner.Stream(ctx, "vzdump", args...)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vzdump stream failed: %w", err)
+		c.vzdumpMu.Unlock()
+		return nil, fmt.Errorf("vzdump stream failed: %w", err)
 	}
 
 	stderrBuf := &bytes.Buffer{}
@@ -86,38 +63,14 @@ func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadC
 		_, _ = io.Copy(stderrBuf, stream.Stderr)
 	}()
 
-	header, err := readStreamHeader(stream.Stdout, 16)
-	if err != nil {
-		_ = stream.Abort()
-		_ = stream.Finish()
-		<-doneCh
-		return "", nil, nil, fmt.Errorf("unable to read vzdump stream header: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
-	}
-	if len(header) == 0 {
-		_ = stream.Abort()
-		_ = stream.Finish()
-		<-doneCh
-		return "", nil, nil, fmt.Errorf("empty vzdump stream header: %s", strings.TrimSpace(stderrBuf.String()))
-	}
-
-	compressionSuffix := detectCompressionSuffix(header)
-	timestamp := time.Now().Format("2006_01_02-15_04_05")
-	archivePath := BuildDumpFilename(c.cfg, vmType, vmid, timestamp, baseExt, compressionSuffix)
-
-	stdout := io.MultiReader(bytes.NewReader(header), stream.Stdout)
-
-	size := int64(0)
-	reader := &countingReadCloser{
-		count: &size,
-		reader: &streamReadCloser{
-			stdout:     stdout,
-			finish:     stream.Finish,
-			stderr:     stderrBuf,
-			stderrDone: doneCh,
-		},
-	}
-
-	return archivePath, reader, &size, nil
+	return &streamReadCloser{
+		stdout:     stream.Stdout,
+		finish:     stream.Finish,
+		abort:      stream.Abort,
+		release:    c.vzdumpMu.Unlock,
+		stderr:     stderrBuf,
+		stderrDone: doneCh,
+	}, nil
 }
 
 func (c *Client) ReadQEMUConfig(ctx context.Context, vmid int) ([]byte, error) {
@@ -149,7 +102,7 @@ func (c *Client) readVMConfig(ctx context.Context, vmType string, vmid int) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("unable to read %s config %s: %w", vmType, configPath, err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	configData, err := io.ReadAll(reader)
 	if err != nil {
@@ -159,59 +112,13 @@ func (c *Client) readVMConfig(ctx context.Context, vmType string, vmid int) ([]b
 	return configData, nil
 }
 
-var archiveRegex = regexp.MustCompile(`(?m)creating (?:vzdump )?archive ['"]([^'"]+)['"]`)
-
-func parseArchivePath(output string) string {
-	matches := archiveRegex.FindStringSubmatch(output)
-	if len(matches) < 2 {
-		return ""
-	}
-	return strings.TrimSpace(matches[1])
-}
-
-func dumpBaseExtension(vmType string) (string, error) {
-	switch vmType {
-	case "qemu":
-		return "vma", nil
-	case "lxc":
-		return "tar", nil
-	default:
-		return "", fmt.Errorf("unsupported VM type: %s", vmType)
-	}
-}
-
-func readStreamHeader(reader io.Reader, size int) ([]byte, error) {
-	if size <= 0 {
-		return nil, nil
-	}
-	buf := make([]byte, size)
-	n, err := io.ReadFull(reader, buf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return buf[:n], nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func detectCompressionSuffix(header []byte) string {
-	if len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b {
-		return ".gz"
-	}
-	if len(header) >= 4 && header[0] == 0x28 && header[1] == 0xb5 && header[2] == 0x2f && header[3] == 0xfd {
-		return ".zst"
-	}
-	lzoMagic := []byte{0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a}
-	if len(header) >= len(lzoMagic) && bytes.HasPrefix(header, lzoMagic) {
-		return ".lzo"
-	}
-	return ""
-}
-
 type streamReadCloser struct {
 	stdout     io.Reader
 	finish     func() error
+	abort      func() error
+	release    func()
+	read       int64
+	eof        bool
 	stderr     *bytes.Buffer
 	stderrDone <-chan struct{}
 	closed     bool
@@ -221,9 +128,14 @@ type streamReadCloser struct {
 
 func (r *streamReadCloser) Read(p []byte) (int, error) {
 	n, err := r.stdout.Read(p)
+	r.read += int64(n)
 	if err == io.EOF {
+		r.eof = true
 		if finishErr := r.finalize(); finishErr != nil {
 			return n, finishErr
+		}
+		if r.read == 0 {
+			return 0, fmt.Errorf("vzdump produced no data")
 		}
 	}
 	return n, err
@@ -234,6 +146,10 @@ func (r *streamReadCloser) Close() error {
 		return nil
 	}
 	r.closed = true
+	if !r.eof && r.abort != nil {
+		_ = r.abort()
+		go func() { _, _ = io.Copy(io.Discard, r.stdout) }()
+	}
 	return r.finalize()
 }
 
@@ -243,67 +159,18 @@ func (r *streamReadCloser) finalize() error {
 	}
 	r.finished = true
 
+	if r.stderrDone != nil {
+		<-r.stderrDone
+	}
 	var err error
 	if r.finish != nil {
 		err = r.finish()
 	}
-	if r.stderrDone != nil {
-		<-r.stderrDone
+	if r.release != nil {
+		r.release()
 	}
 	if err != nil {
 		r.finishErr = fmt.Errorf("vzdump failed: %w: %s", err, strings.TrimSpace(r.stderr.String()))
 	}
 	return r.finishErr
-}
-
-type countingReadCloser struct {
-	reader io.ReadCloser
-	count  *int64
-}
-
-func (c *countingReadCloser) Read(p []byte) (int, error) {
-	n, err := c.reader.Read(p)
-	if c.count != nil && n > 0 {
-		*c.count += int64(n)
-	}
-	return n, err
-}
-
-func (c *countingReadCloser) Close() error {
-	return c.reader.Close()
-}
-
-func (c *Client) findLatestDump(ctx context.Context, vmid int) (string, error) {
-	stdout, stderr, err := c.runner.Run(ctx, "ls", "-1", "--", c.cfg.DumpDir)
-	if err != nil {
-		return "", fmt.Errorf("fallback listing failed: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	var (
-		bestPath string
-		bestTime time.Time
-	)
-
-	for _, name := range strings.Split(strings.TrimSpace(stdout), "\n") {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if !isArchiveForVM(name, vmid) {
-			continue
-		}
-
-		fullPath := path.Join(c.cfg.DumpDir, name)
-		info, err := c.runner.Stat(ctx, fullPath)
-		if err != nil {
-			continue
-		}
-		modTime := info.ModTime()
-		if bestPath == "" || modTime.After(bestTime) {
-			bestPath = fullPath
-			bestTime = modTime
-		}
-	}
-
-	return bestPath, nil
 }

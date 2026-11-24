@@ -14,22 +14,30 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-package proxmox
+package runner
 
 import (
 	"context"
 	"io"
-	"os"
+	"net"
+	"time"
 )
+
+const killDelay = 5 * time.Minute
 
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) (string, string, error)
 	Stream(ctx context.Context, name string, args ...string) (*CommandStream, error)
 	Open(ctx context.Context, filepath string) (io.ReadCloser, error)
 	Create(ctx context.Context, filepath string) (io.WriteCloser, error)
-	Stat(ctx context.Context, filepath string) (os.FileInfo, error)
 	Remove(ctx context.Context, filepath string) error
+	ListenUnix(socketPath string) (net.Listener, error)
+	DialUnix(socketPath string) (net.Conn, error)
 	Close() error
+}
+
+func sparseWriteArgs(filepath string) []string {
+	return []string{"dd", "of=" + filepath, "bs=1M", "iflag=fullblock", "conv=sparse", "status=none"}
 }
 
 type CommandStream struct {
@@ -53,9 +61,6 @@ func (s *CommandStream) Abort() error {
 	return s.abort()
 }
 
-func NewRunner(cfg *Config) (Runner, error) {
-	if cfg.Mode == ModeLocal {
-		return &LocalRunner{}, nil
-	}
-	return NewSSHRunner(cfg)
+func NewCommandStream(stdout, stderr io.Reader, finish, abort func() error) *CommandStream {
+	return &CommandStream{Stdout: stdout, Stderr: stderr, finish: finish, abort: abort}
 }
