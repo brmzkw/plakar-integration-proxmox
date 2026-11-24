@@ -26,7 +26,7 @@ uninstall:
 	-$(PLAKAR) pkg rm proxmox
 
 install: package
-	$(PLAKAR) pkg add ./$(PTAR)
+	$(PLAKAR) pkg add -allow-unsigned ./$(PTAR)
 
 reinstall: uninstall install
 
