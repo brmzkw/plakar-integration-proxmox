@@ -123,11 +123,11 @@ Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them i
 ## Snapshot layout
 
 ```
-/backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar            container dump
-/backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_lxc.conf   its config
-/backup/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_pool.conf  its pool, if any
-/backup/qemu/<vmid>_<name>/qemu-<time>/manifest.json              VM config, firewall, pool, disk sizes
-/backup/qemu/<vmid>_<name>/qemu-<time>/vm-<device>.raw             one raw image per disk, e.g. vm-drive-scsi0.raw
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar            container dump
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_lxc.conf   its config
+/lxc/<vmid>_<name>/vzdump-lxc-<vmid>-<time>.tar_pool.conf  its pool, if any
+/qemu/<vmid>_<name>/manifest.json              VM config, firewall, pool, disk sizes
+/qemu/<vmid>_<name>/vm-<device>.raw             one raw image per disk, e.g. vm-drive-scsi0.raw
 ```
 
 `<time>` is the backup start time on the machine running Plakar, as `YYYY_MM_DD-HH_MM_SS`.

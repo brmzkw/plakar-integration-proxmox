@@ -13,8 +13,8 @@ How the integration works inside. For what runs on the node, see [COMMANDS.md](C
    cluster reports as `unknown` (node unreachable) are skipped with a warning.
 4. If a QEMU VM is selected, check PVE 8.4 or later, the `plakar` storage, and that
    `fleecing_storage` is active when set.
-5. Each guest becomes records under `/backup/<type>/<vmid>_<name>/`. A guest that fails is reported
-   as an error entry at `/backup/<vmid>`, and the job carries on with the others. The job only fails
+5. Each guest becomes records under `/<type>/<vmid>_<name>/`. A guest that fails is reported
+   as an error entry at `/<vmid>`, and the job carries on with the others. The job only fails
    if every guest failed.
 
 ### Containers
