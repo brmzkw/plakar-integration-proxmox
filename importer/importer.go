@@ -48,7 +48,6 @@ type selection struct {
 }
 
 const protocolName = "proxmox+backup"
-const backupSnapshotRoot = "/backup"
 
 func init() {
 	if err := importer.Register(protocolName, 0, NewProxmoxImporter); err != nil {
@@ -218,7 +217,7 @@ func (p *ProxmoxImporter) importVMProvider(ctx context.Context, records chan<- *
 		return fmt.Errorf("qemu %d has no disk to back up", vmid)
 	}
 
-	dir := buildBackupSnapshotPath("qemu", vmid, vmName, proxmox.ProviderBackupDirName(time.Now()))
+	dir := buildBackupSnapshotPath("qemu", vmid, vmName, "")
 	recs := p.client.ProviderBackup(ctx, vmid, pool, devices)
 	for i, rec := range recs {
 		if err := p.emitRecord(ctx, records, newRecord(path.Join(dir, rec.File), -1, rec.Reader)); err != nil {
@@ -287,11 +286,11 @@ func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connec
 }
 
 func vmFailurePath(vmid int) string {
-	return path.Join(backupSnapshotRoot, strconv.Itoa(vmid))
+	return "/" + strconv.Itoa(vmid)
 }
 
 func buildBackupSnapshotPath(vmType string, vmid int, vmName, filename string) string {
-	return path.Join(backupSnapshotRoot, vmType, buildBackupSnapshotDir(vmid, vmName), filename)
+	return path.Join("/", vmType, buildBackupSnapshotDir(vmid, vmName), filename)
 }
 
 func buildBackupSnapshotDir(vmid int, vmName string) string {

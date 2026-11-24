@@ -73,7 +73,7 @@ func fileRecord(pathname, content string) *connectors.Record {
 func TestExportRequiresVMID(t *testing.T) {
 	records := make(chan *connectors.Record, 1)
 	results := make(chan *connectors.Result, 1)
-	records <- fileRecord("/backup/qemu/100_a/qemu-2026_11_18-14_00_00/manifest.json", "{}")
+	records <- fileRecord("/qemu/100_a/manifest.json", "{}")
 	close(records)
 
 	err := (&ProxmoxExporter{temp: proxmox.NewTempFiles(nil)}).Export(context.Background(), records, results)
@@ -88,7 +88,7 @@ func TestExportRequiresVMID(t *testing.T) {
 func TestProviderRunSkipsOtherVMs(t *testing.T) {
 	results := make(chan *connectors.Result, 10)
 	run := &providerRun{p: &ProxmoxExporter{restoreOpts: restoreOptions{vmid: 200}}, ctx: context.Background(), results: results}
-	dir := "/backup/qemu/100_a/qemu-2026_11_18-14_00_00/"
+	dir := "/qemu/100_a/"
 
 	run.handle(fileRecord(dir+"manifest.json", `{"version":1,"vmid":100,"devices":{"drive-scsi0":{"size":4}}}`))
 	run.handle(fileRecord(dir+"vm-drive-scsi0.raw", "disk"))
@@ -111,7 +111,7 @@ func TestProviderRunDiskBeforeManifest(t *testing.T) {
 	results := make(chan *connectors.Result, 1)
 	run := &providerRun{p: &ProxmoxExporter{restoreOpts: restoreOptions{vmid: 100}}, ctx: context.Background(), results: results}
 
-	run.handle(fileRecord("/backup/qemu/100_a/qemu-2026_11_18-14_00_00/vm-drive-scsi0.raw", "disk"))
+	run.handle(fileRecord("/qemu/100_a/vm-drive-scsi0.raw", "disk"))
 	if res := <-results; res.Err == nil || !strings.Contains(res.Err.Error(), "comes before") {
 		t.Fatalf("got %v", res.Err)
 	}

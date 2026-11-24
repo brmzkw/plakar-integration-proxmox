@@ -57,12 +57,6 @@ const (
 
 var providerDeviceRegex = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9_.-]*$`)
 
-var ProviderBackupDirRegex = regexp.MustCompile(`^qemu-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$`)
-
-func ProviderBackupDirName(t time.Time) string {
-	return "qemu-" + t.Format(DumpTimeFormat)
-}
-
 func ProviderDiskFile(device string) string {
 	return ProviderDiskPrefix + device + ProviderDiskSuffix
 }

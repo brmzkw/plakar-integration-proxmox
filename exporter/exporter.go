@@ -155,7 +155,7 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
-		if proxmox.ProviderBackupDirRegex.MatchString(path.Base(path.Dir(record.Pathname))) {
+		if isProviderFile(path.Base(record.Pathname)) {
 			run.handle(record)
 			continue
 		}
@@ -255,6 +255,11 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 		return fmt.Errorf("no backup of VM/CT %d in this snapshot", p.restoreOpts.vmid)
 	}
 	return nil
+}
+
+func isProviderFile(base string) bool {
+	_, ok := proxmox.ParseProviderDiskFile(base)
+	return ok || base == proxmox.ProviderManifestFile
 }
 
 type providerRun struct {

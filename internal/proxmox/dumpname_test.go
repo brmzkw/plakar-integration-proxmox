@@ -18,7 +18,6 @@ package proxmox
 
 import (
 	"testing"
-	"time"
 )
 
 func TestParseSidecarFilename(t *testing.T) {
@@ -39,15 +38,5 @@ func TestParseSidecarFilename(t *testing.T) {
 	}
 	if _, _, ok := ParseSidecarFilename("vzdump-lxc-1-x.tar.zst"); ok {
 		t.Error("an archive is not a sidecar")
-	}
-}
-
-func TestProviderBackupDirName(t *testing.T) {
-	name := ProviderBackupDirName(time.Date(2026, 11, 12, 14, 40, 38, 0, time.UTC))
-	if name != "qemu-2026_11_12-14_40_38" || !ProviderBackupDirRegex.MatchString(name) {
-		t.Fatalf("got %q", name)
-	}
-	if ProviderBackupDirRegex.MatchString("qemu-2026_11_12-14_40_38.tar") {
-		t.Fatal("the old tar name must not match")
 	}
 }
